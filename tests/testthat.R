@@ -1,0 +1,1 @@
+library(testthat); test_check("BATON")

@@ -1,0 +1,563 @@
+---
+title: "Introduction to BATON: Bayesian Optimization for Clinical Trial Calibration"
+author: "BATON Package Authors"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to BATON}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+# Overview
+
+The **BATON** package provides a modular framework for constrained Bayesian optimization of Bayesian adaptive clinical trial designs. It implements:
+
+- **Heteroskedastic Gaussian process surrogates** for modeling operating characteristics
+- **Constraint-aware acquisition functions** (Expected Constrained Improvement)
+- **Multi-fidelity simulation** for efficient budget allocation
+- **Sensitivity and covariance analyses** for design understanding
+
+# Installation
+
+```{r eval=FALSE}
+# Install from GitHub
+devtools::install_github("naimurashid/BATON")
+```
+
+```{r}
+library(BATON)
+```
+
+# Quick Start Example
+
+## 1. Define Your Simulator
+
+The simulator is the core of your calibration workflow. It takes design parameters and returns operating characteristics (power, type I error, expected sample size, etc.).
+
+### Basic Simulator Structure
+
+This simulator models a **two-stage adaptive trial with early stopping for futility**.
+At an interim look, the trial stops early if the observed response rate is too low to be
+promising. Otherwise, enrollment continues to `n_max` and H0 is rejected if the final
+response rate exceeds `efficacy_threshold`.
+
+Note that in practice, BATON is designed for *computationally expensive* simulators
+(e.g., survival trials with Bayesian posterior probability stopping rules that take
+seconds per evaluation). The toy simulator below is intentionally fast for vignette
+purposes, but the optimization workflow is identical.
+
+```{r}
+# Fixed assumptions about the trial (not optimized)
+p0 <- 0.20  # null response rate
+p1 <- 0.40  # alternative response rate
+
+# Two-stage adaptive trial simulator
+simple_simulator <- function(theta, fidelity = c("low", "med", "high"), seed = NULL, ...) {
+  fidelity <- match.arg(fidelity)
+
+  # Number of Monte Carlo replications by fidelity
+  n_rep <- switch(fidelity,
+                  low = 200,
+                  med = 1000,
+                  high = 10000)
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # Extract design parameters
+  n_max              <- round(theta$n_max)
+  interim_fraction   <- theta$interim_fraction
+  futility_threshold <- theta$futility_threshold
+  efficacy_threshold <- theta$efficacy_threshold
+
+  n_interim <- max(1L, round(interim_fraction * n_max))
+  n_final   <- n_max - n_interim
+
+  # --- Vectorised simulation (no loop) ---
+
+  sim_one_hypothesis <- function(p) {
+    # Stage 1: interim responses
+    x_interim  <- rbinom(n_rep, n_interim, p)
+    not_futile <- (x_interim / n_interim) >= futility_threshold
+
+    # Stage 2: remaining responses (only for non-futile trials)
+    x_remaining <- rbinom(n_rep, n_final, p)
+    x_total     <- x_interim + x_remaining
+
+    reject <- not_futile & (x_total / n_max > efficacy_threshold)
+    en     <- ifelse(not_futile, n_max, n_interim)
+
+    list(reject = reject, en = en)
+  }
+
+  alt  <- sim_one_hypothesis(p1)
+  null <- sim_one_hypothesis(p0)
+
+  metrics <- c(
+    power = mean(alt$reject),
+    type1 = mean(null$reject),
+    EN    = mean(alt$en)
+  )
+
+  variance <- c(
+    power = var(alt$reject)  / n_rep,
+    type1 = var(null$reject) / n_rep,
+    EN    = var(alt$en)      / n_rep
+  )
+
+  attr(metrics, "variance") <- variance
+  attr(metrics, "n_rep")    <- n_rep
+
+  return(metrics)
+}
+```
+
+### Test the Simulator
+
+```{r}
+# Test with some parameters
+test_result <- simple_simulator(
+  theta = list(n_max = 60, interim_fraction = 0.5,
+               futility_threshold = 0.20, efficacy_threshold = 0.35),
+  fidelity = "low",
+  seed = 123
+)
+
+print(test_result)
+print(attr(test_result, "variance"))
+```
+
+## 2. Define Design Space and Constraints
+
+```{r}
+# Parameter bounds
+bounds <- list(
+  n_max              = c(20, 100),   # Maximum sample size
+  interim_fraction   = c(0.3, 0.7),  # Fraction enrolled at interim look
+  futility_threshold = c(0.05, 0.40),# Stop early if interim rate below this
+  efficacy_threshold = c(0.25, 0.60) # Reject H0 if final rate above this
+)
+
+# Objective: minimize expected sample size under the alternative
+objective <- "EN"
+
+# Constraints: power >= 0.80, type I error <= 0.10
+constraints <- list(
+  power = c("ge", 0.80),
+  type1 = c("le", 0.10)
+)
+```
+
+## 3. Run Bayesian Optimization
+
+```{r eval=FALSE}
+# Run calibration (d = 4; n_init = 10 x d, budget = ~15 x d)
+fit <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  n_init = 40,      # Initial LHS design points (10 x d)
+  q = 2,            # Batch size per iteration
+  budget = 100,     # Total evaluations (~25 x d)
+  seed = 2025
+)
+```
+
+```{r echo=FALSE}
+# For vignette building, use smaller budget
+fit <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  n_init = 20,
+  q = 2,
+  budget = 50,
+  seed = 2025,
+  progress = FALSE
+)
+```
+
+## 4. Examine Results
+
+```{r}
+# Best design parameters
+print(fit$best_theta)
+
+# Operating characteristics at best design
+feasible = fit$history[fit$history$feasible,]
+best = feasible[which.min(feasible$objective),]
+best_idx <- best$eval_id
+print(fit$history$metrics[[best_idx]])
+
+# Optimization history
+head(fit$history[, c("iter", "fidelity", "objective", "feasible")])
+```
+
+# Memory-Efficient Variance Estimation
+
+**Why variance matters**: Providing variance estimates enables heteroskedastic Gaussian process surrogates, which dramatically improve optimization efficiency (30-50% fewer evaluations).
+
+## Using `welford_mean_var()` for Efficiency
+
+Instead of storing all samples in memory, use Welford's online algorithm:
+
+```{r}
+# RECOMMENDED: Memory-efficient simulator using Welford's algorithm
+efficient_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
+  n_rep <- switch(fidelity,
+                  low = 200,
+                  med = 1000,
+                  high = 10000)
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # Use Welford's algorithm - no need to store all samples!
+  result <- welford_mean_var(
+    sample_fn = function(i, theta) {
+      # Simulate ONE trial
+      test_stat <- rnorm(1, mean = theta$threshold, sd = 1)
+      power <- as.numeric(abs(test_stat) > qnorm(1 - theta$alpha/2))
+
+      test_stat_null <- rnorm(1, mean = 0, sd = 1)
+      type1 <- as.numeric(abs(test_stat_null) > qnorm(1 - theta$alpha/2))
+
+      sample_size <- rpois(1, lambda = 100)
+
+      c(power = power,
+        type1 = type1,
+        EN = sample_size,
+        ET = sample_size / 10)
+    },
+    n_samples = n_rep,
+    theta = theta
+  )
+
+  # Extract results
+  metrics <- result$mean
+  attr(metrics, "variance") <- result$variance
+  attr(metrics, "n_rep") <- result$n
+
+  return(metrics)
+}
+```
+
+### Memory Comparison
+
+```{r}
+# Traditional approach (storing all samples)
+traditional_memory <- function(n_rep, n_metrics) {
+  8 * n_rep * n_metrics  # bytes
+}
+
+# Welford approach (incremental)
+welford_memory <- function(n_metrics) {
+  8 * 2 * n_metrics  # bytes (just mean and M2 vectors)
+}
+
+# For n_rep = 10,000 and 4 metrics:
+cat("Traditional: ", traditional_memory(10000, 4) / 1024, "KB\n")
+cat("Welford:     ", welford_memory(4), "bytes\n")
+cat("Reduction:   ", traditional_memory(10000, 4) / welford_memory(4), "x\n")
+```
+
+**Result**: Welford uses **5,000x less memory** with only ~2% computational overhead!
+
+## Parallel Simulators with `pool_welford_results()`
+
+For expensive simulations, run chunks in parallel and pool the results:
+
+```{r eval=FALSE}
+parallel_simulator <- function(theta, fidelity = "high", n_cores = 4, ...) {
+  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+  chunk_size <- ceiling(n_rep / n_cores)
+
+  # Run chunks in parallel
+  library(parallel)
+  chunks <- mclapply(1:n_cores, function(core_id) {
+    welford_mean_var(
+      sample_fn = function(i, theta) {
+        # Your trial simulation here
+        c(power = ..., EN = ...)
+      },
+      n_samples = chunk_size,
+      theta = theta
+    )
+  }, mc.cores = n_cores)
+
+  # Pool results using Chan's algorithm
+  pooled <- pool_welford_results(chunks)
+
+  metrics <- pooled$mean
+  attr(metrics, "variance") <- pooled$variance
+  attr(metrics, "n_rep") <- pooled$n
+
+  return(metrics)
+}
+```
+
+# Multi-Fidelity Optimization
+
+BATON automatically manages multi-fidelity evaluations to maximize efficiency:
+
+## How It Works
+
+1. **Initial design**: Low-fidelity evaluations explore the space
+2. **Adaptive fidelity**: Higher fidelity for promising/uncertain regions
+   - P(feasible) ≥ 0.75 → high fidelity (n=10,000)
+   - P(feasible) ≥ 0.40 → medium fidelity (n=1,000)
+   - Otherwise → low fidelity (n=200)
+3. **Budget tracking**: Monitors total simulation cost
+
+```{r}
+# Examine fidelity allocation
+table(fit$history$fidelity)
+
+# Total simulation budget used
+sum(fit$history$n_rep)
+```
+
+## Custom Fidelity Levels
+
+```{r eval=FALSE}
+fit_custom <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  # Custom fidelity levels
+  fidelity_levels = c(
+    low = 100,
+    med = 500,
+    high = 5000
+  ),
+  n_init = 10,
+  budget = 50
+)
+```
+
+# Benchmarking and Comparison
+
+Compare Bayesian optimization against baseline strategies:
+
+```{r eval=FALSE}
+benchmark <- benchmark_methods(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  strategies = c("bo", "random", "grid"),
+  bo_args = list(n_init = 10, q = 2, budget = 30, seeds = 1:3),
+  random_args = list(n_samples = 30, seeds = 1:3),
+  grid_args = list(resolution = list(threshold = 5, alpha = 5))
+)
+
+# Summary statistics
+summary_tbl <- summarise_benchmark(benchmark)
+print(summary_tbl)
+
+# Visualization
+plot_benchmark_trajectory(benchmark)
+plot_benchmark_efficiency(benchmark)
+```
+
+# Sensitivity Analysis
+
+Understand which parameters most influence your objective:
+
+```{r eval=FALSE}
+# Sobol sensitivity indices
+sobol <- sa_sobol(
+  surrogates = fit$surrogates,
+  bounds = bounds,
+  outcome = "EN",
+  n_mc = 2000
+)
+
+print(sobol)
+plot_sobol_indices(sobol)
+
+# Local gradients
+gradients <- sa_gradients(
+  surrogates = fit$surrogates,
+  theta = fit$best_theta,
+  bounds = bounds,
+  outcome = "EN"
+)
+
+print(gradients)
+
+# Gradient covariance across design space
+cov_matrix <- cov_effects(
+  surrogates = fit$surrogates,
+  bounds = bounds,
+  outcome = "EN",
+  n_mc = 500
+)
+
+print(cov_matrix)
+```
+
+# Advanced Topics
+
+## Constraint Reliability
+
+Validate that calibrated designs truly satisfy constraints:
+
+```{r eval=FALSE}
+reliability <- estimate_constraint_reliability(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  strategies = c("bo", "random"),
+  calibration_seeds = 1:10,
+  validation_reps = 50000,  # Large sample validation
+  bo_args = list(n_init = 10, budget = 30)
+)
+
+print(reliability$summary)
+plot_constraint_reliability(reliability)
+```
+
+## Multi-fidelity Ablation
+
+Study the impact of different fidelity policies:
+
+```{r eval=FALSE}
+ablation <- ablation_multifidelity(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  policies = list(
+    low_only = c(low = 200),
+    med_only = c(med = 1000),
+    full = c(low = 200, med = 1000, high = 10000)
+  ),
+  seeds = 1:10,
+  bo_args = list(n_init = 10, budget = 30)
+)
+
+print(ablation$summary)
+plot_multifidelity_tradeoff(ablation)
+```
+
+## Case Study Reporting
+
+Extract publication-ready summaries:
+
+```{r eval=FALSE}
+# Summarize calibrated design
+summary <- summarise_case_study(fit)
+print(summary$design)
+print(summary$operating_characteristics)
+
+# Comprehensive diagnostics
+diagnostics <- case_study_diagnostics(
+  fit,
+  sobol_samples = 5000,
+  gradient_points = 200
+)
+
+# Visualizations
+plot_feasible_frontier(fit)
+plot_tradeoff_surfaces(fit)
+plot_case_sobol(diagnostics$sobol)
+plot_case_gradient(diagnostics$gradients)
+plot_case_covariance(diagnostics$covariance)
+```
+
+# Best Practices
+
+## ✅ DO:
+
+1. **Always provide variance estimates** in your simulator
+   - Use `welford_mean_var()` for memory efficiency
+   - Enables heteroskedastic GP for 30-50% better performance
+
+2. **Set appropriate fidelity levels**
+   - Low: ~200 reps (exploration)
+   - Med: ~1,000 reps (refinement)
+   - High: ~10,000 reps (exploitation)
+
+3. **Use sufficient initial design**
+   - Minimum: `n_init ≥ 2 × d` where d = number of parameters
+   - Recommended: `n_init = 4-5 × d`
+
+4. **Monitor convergence**
+   - Check `fit$history` for stagnation
+   - Increase budget if needed
+
+5. **Validate results**
+   - Use `estimate_constraint_reliability()` with large samples
+   - Confirm operating characteristics match expectations
+
+## ⚠️ AVOID:
+
+1. **Don't skip variance estimation**
+   - Nugget fallback works but is 30-50% less efficient
+   - For expensive simulations, this wastes significant time
+
+2. **Don't use too small budgets**
+   - Minimum: ~20-30 evaluations for 2D problems
+   - Scale with dimensionality: ~10-15 × d
+
+3. **Don't ignore infeasibility warnings**
+   - If no feasible points found, relax constraints or expand bounds
+
+4. **Don't over-trust surrogates far from data**
+   - GP predictions are uncertain in unexplored regions
+   - Use sensitivity analysis to understand uncertainty
+
+# Troubleshooting
+
+## Error: "Failed to fit surrogate for metric..."
+
+**Cause**: GP fitting failed due to ill-conditioned covariance matrix
+
+**Solutions**:
+- Increase `n_init` for more diverse initial design
+- Check for redundant/highly correlated evaluations
+- Verify variance estimates are positive and finite
+
+## Warning: "No feasible solutions found"
+
+**Cause**: Constraints are too strict or bounds are wrong
+
+**Solutions**:
+- Check constraint thresholds are achievable
+- Expand parameter bounds
+- Increase budget to explore more
+
+## Performance seems slow
+
+**Check**:
+1. Are you providing variance? (Check `attr(metrics, "variance")`)
+2. Is your simulator the bottleneck? (Profile it)
+3. Is `candidate_pool` too large? (Default 2000 is usually fine)
+
+# Further Resources
+
+- **Examples**: See `inst/examples/simulator_with_variance.R`
+- **Code review fixes**: See `CODE_REVIEW_FIXES.md`
+- **Variance explanation**: See `VARIANCE_ESTIMATOR_EXPLANATION.md`
+- **Memory analysis**: See `MEMORY_ANALYSIS.md`
+- **Performance impact**: See `NUGGET_IMPACT_ANALYSIS.md`
+- **Development guide**: See `CLAUDE.md`
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

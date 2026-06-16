@@ -1,0 +1,236 @@
+---
+title: "v0.4.0 hardening: cross-philosophy warmstart and multi-seed verification"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{v0.4.0 hardening: cross-philosophy warmstart and multi-seed verification}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+## Background
+
+BATON v0.4.0 introduces two safeguards to `bo_calibrate()`:
+
+1. **`warmstart_from`**: a Stage 0 parameter that injects previously
+   calibrated designs as initial seeds alongside the Latin hypercube
+   sample, helping the GP surrogate escape local minima.
+2. **`multi_seed_verify`**: a Stage 4 verification gate that re-evaluates
+   the calibrated design at multiple independent seeds at high fidelity,
+   detecting stored-vs-actual operating-characteristic gaps.
+
+Plus a new batch-level wrapper `bo_calibrate_philosophies()` that
+orchestrates both safeguards across a panel of philosophies.
+
+## Why these were added
+
+Both features address empirical failure modes documented in the
+bounds-widening campaign (May 2026) for the JASA 2026 paper on adaptive
+trial calibration:
+
+1. **BO local minima.** A multi-arm Optimal calibration with $w_0 = 1$
+   (sole objective: minimize $E_0[N]$) terminated at $E_0[N] = 67.19$,
+   while a Fleming calibration with $w_0 = 0.5$ terminated at
+   $E_0[N] = 66.18$. Fleming Pareto-dominated Optimal under Optimal's own
+   loss — a calibration artifact attributable to BO settling at a local
+   minimum in the 9-parameter design space. Seeding Stage 0 with
+   Fleming's top-3 high-fidelity verified designs recovered Optimal at
+   $E_0[N] = 65.66$, strictly better than both prior calibrations.
+
+2. **Stored-vs-actual gaps.** Three SYMM cohortA bidirectional designs
+   had calibration-time stored type-I error below the 0.10 regulatory
+   floor but multi-seed verification (5 seeds × R = 10,000 each)
+   revealed multi-seed type-I error in [0.122, 0.170] — stored-vs-actual
+   gaps of approximately 0.075, more than 20 Monte Carlo standard
+   errors. Without multi-seed verification, those designs would have
+   shipped type-I-inflated.
+
+Both failure modes are caught by the new safeguards.
+
+## Stage taxonomy
+
+| Stage | Purpose | Fidelity (R) | Seed |
+|-------|---------|--------------|------|
+| Stage 1 | BO exploration | LOW (e.g., 3000) | single |
+| Stage 2 | BO refinement | MED (e.g., 5000) | single |
+| Stage 3 | High-fidelity verification at the calibrated design | HIGH (e.g., 10000) | single |
+| Stage 4 (v0.4.0) | Multi-seed verification at the calibrated design | HIGH | multiple |
+
+Stage 1/2/3 are **fidelity tiers** within a single BO run at a single
+seed. They harden the surrogate's belief about the calibrated design
+against within-run uncertainty.
+
+Stage 4 (v0.4.0) is on an **orthogonal axis**: seed-dependent
+variability of the calibrated design's true operating characteristics.
+It hardens the calibration against between-trajectory uncertainty.
+
+## Single-philosophy usage
+
+```{r}
+library(BATON)
+
+fit <- bo_calibrate(
+  sim_fun = your_simulator,
+  bounds = list(
+    total_n = c(20, 200),
+    eff = c(0.85, 0.99),
+    fut = c(0.05, 0.40),
+    beat = c(1.0, 16),
+    ev = c(3, 10),
+    margin = c(0.0, 1.0),
+    prior_strength = c(0.1, 1.0),
+    n_intervals = c(2, 5)
+  ),
+  objective = "weighted_EN_N",
+  constraints = list(power = c("ge", 0.80),
+                     type1 = c("le", 0.10)),
+  budget = 300,
+  fidelity_levels = c(low = 3000, med = 5000, high = 10000),
+  multi_seed_verify = TRUE,
+  multi_seed_n = 5,
+  multi_seed_strict = TRUE
+)
+
+# Inspect Stage 4 results
+fit$verdict                            # "MULTI_SEED_PASS" or "MULTI_SEED_FAIL"
+fit$multi_seed_summary$strict_feas     # 1 if all seeds pass, 0 otherwise
+fit$multi_seed_summary$type1_mean      # seed-averaged type-I
+fit$multi_seed_runs                    # per-seed evaluations
+
+# Gate adoption on Stage 4 verdict
+if (fit$verdict == "MULTI_SEED_PASS") {
+  adopt(fit$best_theta)
+} else {
+  message("Stage 4 verification failed; do not adopt.")
+  print(fit$multi_seed_summary)
+}
+```
+
+## Cross-philosophy warmstart
+
+When a philosophy's calibration appears stuck in a local minimum, seed
+its Stage 0 with a sibling philosophy's calibrated design:
+
+```{r}
+# Calibrate Fleming first (no warmstart needed).
+fit_fleming <- bo_calibrate(
+  sim_fun = your_simulator,
+  bounds = your_bounds,
+  objective = "weighted_EN_N",
+  constraints = list(power = c("ge", 0.80), type1 = c("le", 0.10)),
+  budget = 300,
+  multi_seed_verify = TRUE
+)
+
+# Calibrate Optimal with Fleming's design as a Stage 0 seed.
+fit_optimal <- bo_calibrate(
+  sim_fun = your_simulator,
+  bounds = your_bounds,
+  objective = "EN_null",                 # Optimal's loss
+  constraints = list(power = c("ge", 0.80), type1 = c("le", 0.10)),
+  warmstart_from = list(fit_fleming$best_theta),
+  budget = 300,
+  multi_seed_verify = TRUE
+)
+
+# Optimal should now have access to Fleming's basin via the surrogate.
+```
+
+The `warmstart_from` argument also accepts paths to `*_best_design.csv`
+files produced by prior calibrations:
+
+```{r}
+fit_optimal <- bo_calibrate(
+  sim_fun = your_simulator,
+  bounds = your_bounds,
+  objective = "EN_null",
+  constraints = list(power = c("ge", 0.80), type1 = c("le", 0.10)),
+  warmstart_from = list("results/pipeline/fleming_run/fleming_run_best_design.csv"),
+  budget = 300,
+  multi_seed_verify = TRUE
+)
+```
+
+## Multi-philosophy batch calibration
+
+For Pareto-frontier comparison papers, use the new batch wrapper:
+
+```{r}
+batch <- bo_calibrate_philosophies(
+  scenario_id = "cohortA_strong_effect",
+  sim_fun = your_simulator,
+  bounds = your_bounds,
+  philosophies = list(
+    Fleming = list(objective = "weighted_EN_N",
+                    constraints = list(power = c("ge", 0.80),
+                                       type1 = c("le", 0.10))),
+    Minimax = list(objective = "total_n",
+                    constraints = list(power = c("ge", 0.80),
+                                       type1 = c("le", 0.10))),
+    Admissible = list(objective = "weighted_EN_N",
+                       constraints = list(power = c("ge", 0.80),
+                                          type1 = c("le", 0.10))),
+    Optimal = list(objective = "EN_null",
+                    constraints = list(power = c("ge", 0.80),
+                                       type1 = c("le", 0.10))),
+    `Alt-Optimal` = list(objective = "EN_alt",
+                          constraints = list(power = c("ge", 0.80),
+                                             type1 = c("le", 0.10)))
+  ),
+  budget = 300,
+  multi_seed_verify = TRUE,
+  multi_seed_strict = TRUE
+)
+
+# The manifest documents which philosophies passed multi-seed and what
+# they were warmstarted from.
+batch$manifest
+#>     philosophy dependency_role          verdict n_max objective_value warmstart_donors  runtime_s
+#> 1      Fleming           donor MULTI_SEED_PASS    51         13.520                       1234.5
+#> 2      Minimax           donor MULTI_SEED_PASS    47         15.213                        987.6
+#> 3   Admissible           donor MULTI_SEED_PASS    49         13.881                       1156.3
+#> 4      Optimal       recipient MULTI_SEED_PASS    63         11.380   Fleming;Minimax;Admissible  1289.7
+#> 5  Alt-Optimal       recipient MULTI_SEED_PASS    51         16.260   Fleming;Minimax;Admissible  1342.1
+```
+
+## Backward compatibility
+
+All v0.4.0 changes are additive and opt-in. Existing calls to
+`bo_calibrate()` continue to work unchanged:
+
+- `multi_seed_verify` defaults to `FALSE` (Stage 4 not run).
+- `warmstart_from` defaults to `NULL` (LHS-only Stage 0).
+- The pre-existing `initial_history` parameter still works; `warmstart_from`
+  is a higher-level convenience layer that converts user-friendly design
+  specifications to `initial_history` internally. Specifying both in the
+  same call is an error.
+
+## Recommended workflow for production / regulatory calibrations
+
+1. **Always set `multi_seed_verify = TRUE` and `multi_seed_strict = TRUE`.**
+   The performance cost is minor (~20% of total wall time at typical
+   budgets); the failure-detection benefit is substantial.
+2. **For multi-philosophy work, prefer `bo_calibrate_philosophies()`** over
+   ad hoc orchestration of `bo_calibrate()` calls. The wrapper handles
+   dependency ordering, warmstart provenance, and the manifest of
+   verdicts.
+3. **Gate adoption on `fit$verdict == "MULTI_SEED_PASS"`** rather than
+   only on Stage 3 verification. The stored-vs-actual gap can be large
+   (we observed 0.075 on type-I) and is rule-variant- and
+   basin-specific.
+4. **If a calibration fails Stage 4, recalibrate** rather than adopting
+   a flagged design. Possible recalibration strategies (in order of
+   effort):
+   - Adjust bounds (smaller search box may help BO converge to a more
+     stable basin).
+   - Increase budget (more BO iterations may find a stabler design).
+   - Warmstart from a sibling philosophy via `warmstart_from`.
+   - Switch random seed and rerun.
+5. **Document which BO seed produced which design.** BO under wide
+   bounds with bounded budget exhibits restart variance — running the
+   same calibration with a different seed can produce a different
+   calibrated design. Multi-seed verification certifies the seeds the
+   calibration was tested at, not all possible seeds.
