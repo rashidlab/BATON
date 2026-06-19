@@ -3,9 +3,8 @@ Type: Package
 Title: Bayesian Optimization for Calibration of Adaptive Clinical Trials
 Version: 0.4.0
 Authors@R:
-    person(given = "Naim", family = "Rashid", role = c("aut", "cre"),
-           email = "naim_rashid@unc.edu",
-           comment = c(affiliation = "Department of Biostatistics, UNC Chapel Hill; Lineberger Comprehensive Cancer Center"))
+    person(given = "Anonymous", family = "Author", role = c("aut", "cre"),
+           email = "anonymous@example.com")
 Description: Provides a modular framework for constrained Bayesian optimization of Bayesian adaptive clinical trial designs, particularly those with time-to-event endpoints. Implements heteroskedastic Gaussian process surrogates, constraint-aware acquisition functions, multi-fidelity simulation, and emulator-based sensitivity and covariance analyses to guide efficient design calibration under power and type I error constraints.
 License: file LICENSE
 Depends: R (>= 4.2)
@@ -30,8 +29,8 @@ Suggests:
     microbenchmark,
     sensitivity
 VignetteBuilder: knitr
-URL: https://github.com/naimurashid/BATON
-BugReports: https://github.com/naimurashid/BATON/issues
+URL: https://anonymous.4open.science/r/BATON
+BugReports: https://anonymous.4open.science/r/BATON
 Encoding: UTF-8
 LazyData: true
 RoxygenNote: 7.3.3

@@ -31,7 +31,7 @@ The **BATON** package provides a modular framework for constrained Bayesian opti
 
 ```{r eval=FALSE}
 # Install from GitHub
-devtools::install_github("naimurashid/BATON")
+devtools::install_github("<anonymized>/BATON")
 ```
 
 ```{r}

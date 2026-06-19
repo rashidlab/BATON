@@ -283,9 +283,8 @@ If you use these benchmarks in your research:
 ```bibtex
 @software{BATON_benchmarks,
   title = {BATON Benchmarking Suite},
-  author = {Rashid, Naim},
+  author = {Anonymous},
   year = {2025},
-  url = {https://github.com/naimurashid/BATON},
   version = {0.3.0},
   note = {Test problems and validation scripts for BATON performance improvements}
 }
@@ -303,5 +302,4 @@ To contribute new test problems or benchmark scripts:
 
 ## Contact
 
-- **Issues**: [GitHub Issues](https://github.com/naimurashid/BATON/issues)
-- **Author**: Naim Rashid (naim_rashid@unc.edu)
+Author information has been removed for double-anonymous review.

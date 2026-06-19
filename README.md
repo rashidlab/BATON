@@ -2,7 +2,7 @@
 
 **Bayesian Optimization for Calibration of Adaptive Clinical Trials**
 
-Version 0.4.0 | R >= 4.2 | MIT License | [GitHub](https://github.com/naimurashid/BATON) | [Issues](https://github.com/naimurashid/BATON/issues)
+Version 0.4.0 | R >= 4.2 | MIT License
 
 **v0.4.0 (May 2026):** hardening release. New `warmstart_from` parameter
 (Stage 0 cross-philosophy seeds) and `multi_seed_verify` gate (Stage 4
@@ -56,15 +56,15 @@ budgeting, and Welford-based variance estimation.
 
 ```r
 install.packages("remotes")
-remotes::install_github("naimurashid/BATON")
+remotes::install_github("<anonymized>/BATON")
 
 # With vignettes (requires knitr, rmarkdown):
-remotes::install_github("naimurashid/BATON", build_vignettes = TRUE)
+remotes::install_github("<anonymized>/BATON", build_vignettes = TRUE)
 ```
 
 BATON requires R >= 4.2 (see `DESCRIPTION`) and pairs with the companion
 simulator package
-[evolveTrial](https://github.com/naimurashid/evolveTrial), which requires
+[evolveTrial](https://anonymous.4open.science/r/evolveTrial), which requires
 the same R version.
 
 ### Troubleshooting
@@ -76,8 +76,8 @@ the same R version.
 | `hetGP` fails to link BLAS/LAPACK (Linux) | `sudo apt-get install libblas-dev liblapack-dev` (Ubuntu/Debian) or `sudo dnf install blas-devel lapack-devel` (Fedora/RHEL) |
 | `make: not found` (Windows) | Install [Rtools](https://cran.r-project.org/bin/windows/Rtools/) matching your R version; verify with `Sys.which("make")` |
 | `plan(multicore)` runs sequentially on Windows | Use `future::plan(multisession, workers = N)` — Windows has no fork; see "Parallelism" below |
-| Installation times out on CI or slow links | `remotes::install_github("naimurashid/BATON", build_vignettes = FALSE)` |
-| `Error: package or namespace load failed for 'BATON' ... evolveTrial` | Install the companion [evolveTrial](https://github.com/naimurashid/evolveTrial) package first |
+| Installation times out on CI or slow links | `remotes::install_github("<anonymized>/BATON", build_vignettes = FALSE)` |
+| `Error: package or namespace load failed for 'BATON' ... evolveTrial` | Install the companion [evolveTrial](https://anonymous.4open.science/r/evolveTrial) package first |
 
 ## Quick Start
 
@@ -665,13 +665,13 @@ testthat::test_file("tests/testthat/test-BATON-core.R")
 ## Citation
 
 ```bibtex
-@article{rashid2026baton,
+@article{anon2026baton,
   title   = {Constrained {Bayesian} Optimization for Calibration of
              {Bayesian} Adaptive Clinical Trials},
-  author  = {Rashid, Naim},
+  author  = {Anonymous},
   journal = {Journal of the American Statistical Association},
   year    = {2026},
-  note    = {R package version 0.3.0, \url{https://github.com/naimurashid/BATON}}
+  note    = {R package version 0.3.0}
 }
 ```
 
@@ -681,6 +681,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Contact
 
-**Naim Rashid** - Department of Biostatistics, UNC Chapel Hill; Lineberger Comprehensive Cancer Center
-- Email: naim_rashid@unc.edu
-- Issues: <https://github.com/naimurashid/BATON/issues>
+Author information has been removed for double-anonymous review.
