@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Summarise calibrated case-study fit
 #'
 #' @param fit object returned by [bo_calibrate()].

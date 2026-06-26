@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Global sensitivity via Saltelli Sobol indices
 #'
 #' @param surrogates list of surrogate models (from [fit_surrogates()]).

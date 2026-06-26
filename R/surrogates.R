@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Fit Gaussian process surrogates for operating characteristics
 #'
 #' Implements heteroskedastic GP modeling when variance information is available,

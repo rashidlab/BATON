@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Multi-fidelity ablation study for Bayesian optimisation
 #'
 #' Runs the calibration routine under several fidelity policies to quantify
