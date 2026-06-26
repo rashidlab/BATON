@@ -325,8 +325,9 @@ BATON automatically manages multi-fidelity evaluations to maximize efficiency:
    - Otherwise → low fidelity (n=200)
 3. **Budget tracking**: Monitors total simulation cost
 
-```{r}
-# Examine fidelity allocation
+```{r eval=FALSE}
+# Examine fidelity allocation (depends on `fit` from the non-evaluated
+# bo_calibrate chunk above)
 table(fit$history$fidelity)
 
 # Total simulation budget used

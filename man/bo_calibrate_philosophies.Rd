@@ -29,7 +29,10 @@ Same for all philosophies in the batch.}
 \item{philosophies}{Named list, one element per philosophy, each containing
 \code{objective} and \code{constraints} fields (the philosophy-specific
 calibration target). Order does NOT need to be dependency order; the
-wrapper sorts internally.}
+wrapper sorts internally. Each \code{objective} (and every constraint name)
+must be the name of a metric that \code{sim_fun} returns; there is no built-in
+weighted-loss objective, so compute the weighted loss (e.g.
+\code{weighted_EN_N}) inside the simulator and return it as a named metric.}
 
 \item{dependency_order}{Optional character vector specifying which
 philosophies are donors (calibrated first, no warmstart) and which are
