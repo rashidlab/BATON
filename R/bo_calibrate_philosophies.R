@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 # BATON v0.4.0 batch wrapper: calibrate multiple design philosophies for a
 # single scenario in dependency order, with cross-philosophy warmstart and
 # multi-seed verification both enabled by default.

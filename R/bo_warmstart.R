@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 # bo_warmstart.R
 # Warm-starting and parameter refinement for Bayesian Optimization
 #

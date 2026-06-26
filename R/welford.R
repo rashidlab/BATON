@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Compute mean and variance incrementally using Welford's algorithm
 #'
 #' This function provides a memory-efficient way to compute sample means and

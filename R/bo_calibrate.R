@@ -1,3 +1,6 @@
+# Copyright (c) 2026. For not-for-profit research and educational use only; all
+# other rights reserved. See the LICENSE file for full terms.
+
 #' Calibrate adaptive trial designs with constrained Bayesian optimisation
 #'
 #' Implements the methodology described in Section 2 of the manuscript:
