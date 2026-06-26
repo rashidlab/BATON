@@ -27,7 +27,8 @@ Suggests:
     knitr,
     rmarkdown,
     microbenchmark,
-    sensitivity
+    sensitivity,
+    parallel
 VignetteBuilder: knitr
 URL: https://anonymous.4open.science/r/BATON
 BugReports: https://anonymous.4open.science/r/BATON

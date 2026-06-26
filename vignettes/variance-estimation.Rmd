@@ -164,6 +164,8 @@ my_parallel_simulator <- function(theta,
 
   # Run chunks in parallel
   library(parallel)
+  # NOTE: mclapply() is POSIX-only (no forking on Windows). Windows users should
+  # use a PSOCK cluster (parallel::makeCluster() + parLapply()) or plain lapply().
   chunk_results <- mclapply(1:n_cores, function(core_id) {
     # Each core computes its own mean and variance
     welford_mean_var(

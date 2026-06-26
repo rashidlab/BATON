@@ -139,7 +139,8 @@
 #'   list with element `theta` (a named list/vector of parameter values).
 #'   Designs outside the current bounds are filtered with a warning. Default
 #'   `NULL` (LHS-only initial design pool). Internally converted to
-#'   `initial_history`; see `?initial_history` for the lower-level API.
+#'   `initial_history`; see the `initial_history` argument of `bo_calibrate`
+#'   for the lower-level API.
 #' @param multi_seed_verify logical; if `TRUE`, after Stage 3 selects the
 #'   calibrated design, re-evaluate it at `multi_seed_n` independent seeds at
 #'   `multi_seed_reps` fidelity to detect stored-vs-actual operating-
@@ -1100,6 +1101,26 @@ record_evaluation <- function(history,
     stop(sprintf("Objective '%s' not returned by simulator.", objective), call. = FALSE)
   }
 
+  # Validate that every constraint metric name is actually returned by the
+  # simulator. Without this check, a misnamed constraint metric (e.g. "pwr"
+  # instead of "power") is silently treated as infeasible by is_feasible()
+  # (metrics[[metric]] is NULL -> FALSE), so no design is ever feasible,
+  # best_objective becomes NA, multi-seed verification is skipped, and the
+  # run reports "success" with garbage output. Mirror the upfront objective
+  # check above so the failure is loud and immediate.
+  if (nrow(constraint_tbl) > 0L) {
+    missing_constraints <- setdiff(constraint_tbl$metric, names(metrics))
+    if (length(missing_constraints) > 0L) {
+      stop(sprintf(
+        paste0("Constraint metric(s) not returned by simulator: %s. ",
+               "Simulator returned: %s. Constraint names must match the ",
+               "names of the metrics the simulator returns."),
+        paste(missing_constraints, collapse = ", "),
+        paste(names(metrics), collapse = ", ")
+      ), call. = FALSE)
+    }
+  }
+
   if (progress) {
     msg <- sprintf("  Eval %03d (iter %02d, %s fidelity): %s = %.4f%s",
                    eval_id, iter, fidelity, objective, objective_value,
@@ -1295,6 +1316,15 @@ default_variance_estimator <- function(metrics, n_rep) {
 validate_fidelity_levels <- function(fidelity_levels) {
   if (is.null(names(fidelity_levels))) {
     stop("`fidelity_levels` must be a named numeric vector.", call. = FALSE)
+  }
+  # The code hard-indexes fidelity_levels[["low"]] / [["med"]] / [["high"]],
+  # so the names must be exactly that set (in any order). Without this check a
+  # misnamed level produces a confusing subscript-out-of-bounds error later.
+  if (!setequal(names(fidelity_levels), c("low", "med", "high"))) {
+    stop(sprintf(
+      "`fidelity_levels` must be named exactly 'low', 'med', 'high'; got: %s.",
+      paste(names(fidelity_levels), collapse = ", ")
+    ), call. = FALSE)
   }
   # Use base R for loop instead of purrr::iwalk
   for (i in seq_along(fidelity_levels)) {
