@@ -41,7 +41,10 @@
 #' @param philosophies Named list, one element per philosophy, each
 #'   containing `objective` and `constraints` fields (the philosophy-specific
 #'   calibration target). Order does NOT need to be dependency order; the
-#'   wrapper sorts internally.
+#'   wrapper sorts internally. Each `objective` (and every constraint name)
+#'   must be the name of a metric that `sim_fun` returns; there is no built-in
+#'   weighted-loss objective, so compute the weighted loss (e.g.
+#'   `weighted_EN_N`) inside the simulator and return it as a named metric.
 #' @param dependency_order Optional character vector specifying which
 #'   philosophies are donors (calibrated first, no warmstart) and which are
 #'   recipients (calibrated second, warmstart from all preceding successful

@@ -1,28 +1,5 @@
 # BATON Changelog
 
-## Documentation note (2026-06-03)
-
-### Fidelity modes used in the JASA 2026 manuscript
-
-The reported calibrations in the JASA 2026 manuscript ("Constrained Bayesian
-Optimization for Calibration of Bayesian Adaptive Clinical Trials") were produced
-with a **three-stage fixed-fidelity** schedule (`stage_fidelity_mode =
-"fixed_per_stage"` in the manuscript's `warmstart_core.R`): Stage 1 at `R_low`,
-Stage 2 at `R_med`, Stage 3 at `R_high`, with high-fidelity verification of every
-reported design. Under this mode each stage passes a single fidelity level, so the
-per-candidate cost-aware fidelity *selection* (`select_fidelity_adaptive`,
-cost-adjusted ECI / value-per-cost) and the coefficient-of-variation promotion
-threshold (`fidelity_cv_threshold`, default `0.05`) are **not exercised** for the
-reported designs.
-
-These remain fully supported package features for users who want per-candidate
-fidelity selection: see `?bo_calibrate` (the `fidelity_method`, `fidelity_costs`,
-and `fidelity_cv_threshold` arguments) and the **advanced-features** vignette, which
-documents the `adaptive`, `staged`, and `threshold` modes and their value-per-cost
-machinery, together with the `0.4`/`1.0`/`5.0` relative-cost model and the CV-threshold
-sensitivity analysis. To keep the paper focused on the configuration actually used,
-the manuscript supplement no longer reproduces this material and points here instead.
-
 ## BATON 0.4.0 (2026-05-09)
 
 ### Hardening release: cross-philosophy warmstart + multi-seed verification
@@ -141,6 +118,11 @@ fit <- BATON::bo_calibrate(
   multi_seed_n = 5,
   multi_seed_strict = TRUE
 )
+
+# NOTE: `objective` and every constraint name must be the name of a metric
+# `your_simulator` returns. There is no built-in weighted-loss objective, so
+# compute the weighted loss (here `weighted_EN_N`) inside the simulator and
+# return it as a named metric (see the README "Design Philosophies" section).
 
 if (fit$verdict == "MULTI_SEED_PASS") {
   adopt_design(fit$best_theta)
