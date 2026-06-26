@@ -31,8 +31,8 @@ Suggests:
     sensitivity,
     parallel
 VignetteBuilder: knitr
-URL: https://github.com/naimurashid/BATON
-BugReports: https://github.com/naimurashid/BATON/issues
+URL: https://github.com/rashidlab/BATON
+BugReports: https://github.com/rashidlab/BATON/issues
 Encoding: UTF-8
 LazyData: true
 RoxygenNote: 7.3.3
