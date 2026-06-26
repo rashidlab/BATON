@@ -173,8 +173,10 @@ fit <- bo_calibrate(
 )
 ```
 
-```{r echo=FALSE}
-# For vignette building, use smaller budget
+```{r echo=FALSE, eval=FALSE}
+# Not evaluated at build time: running a live bo_calibrate() during
+# build_vignettes = TRUE invokes a real Bayesian optimization, which is slow and
+# can fail on a thin toolchain. The output is illustrative only.
 fit <- bo_calibrate(
   sim_fun = simple_simulator,
   bounds = bounds,
@@ -190,7 +192,9 @@ fit <- bo_calibrate(
 
 ## 4. Examine Results
 
-```{r}
+```{r eval=FALSE}
+# Not evaluated at build time: depends on `fit` from the (non-evaluated)
+# calibration chunk above.
 # Best design parameters
 print(fit$best_theta)
 
@@ -284,6 +288,8 @@ parallel_simulator <- function(theta, fidelity = "high", n_cores = 4, ...) {
 
   # Run chunks in parallel
   library(parallel)
+  # NOTE: mclapply() is POSIX-only (no forking on Windows). Windows users should
+  # use a PSOCK cluster (parallel::makeCluster() + parLapply()) or plain lapply().
   chunks <- mclapply(1:n_cores, function(core_id) {
     welford_mean_var(
       sample_fn = function(i, theta) {

@@ -2,7 +2,7 @@
 
 **Bayesian Optimization for Calibration of Adaptive Clinical Trials**
 
-Version 0.4.0 | R >= 4.2 | MIT License | [GitHub](https://github.com/naimurashid/BATON) | [Issues](https://github.com/naimurashid/BATON/issues)
+Version 0.4.0 | R >= 4.2 | UNC not-for-profit license | [GitHub](https://github.com/naimurashid/BATON) | [Issues](https://github.com/naimurashid/BATON/issues)
 
 **v0.4.0 (May 2026):** hardening release. New `warmstart_from` parameter
 (Stage 0 cross-philosophy seeds) and `multi_seed_verify` gate (Stage 4
@@ -522,8 +522,44 @@ produces different design philosophies, all subject to the same constraints:
 | H1-Optimal | 0 | 0 | 1 | Minimize E[N] under alternative |
 | Admissible | varies | varies | varies | Pareto-optimal trade-offs |
 
-Implement this by having your simulator return `EN_null`, `EN_alt`, and
-`N_max` as metrics, and set `objective` to the appropriate weighted sum.
+BATON has no built-in weighted-loss constructor: `objective` (and every name in
+`constraints`) must be the **name of a metric your simulator returns**. There is
+no automatic "weighted sum" objective; if you pass an `objective` the simulator
+does not return, `bo_calibrate()` errors with `Objective '...' not returned by
+simulator`. To use the weighted loss, have the **simulator itself compute and
+return** the combined metric, then point `objective` at it:
+
+```r
+# Choose the weights for the desired philosophy (see table above).
+w_N <- 0; w_0 <- 0.5; w_1 <- 0.5   # e.g. Balanced (Fleming)
+
+weighted_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
+  # ... run trial replications, then compute the raw operating characteristics:
+  EN_null <- ...   # expected sample size under the null
+  EN_alt  <- ...   # expected sample size under the alternative
+  N_max   <- ...   # maximum sample size
+  power   <- ...
+  type1   <- ...
+
+  # Simulator computes the weighted loss and RETURNS it as a named metric:
+  weighted_EN_N <- w_N * N_max + (1 - w_N) * (w_0 * EN_null + w_1 * EN_alt)
+
+  c(weighted_EN_N = weighted_EN_N,
+    EN_null = EN_null, EN_alt = EN_alt, N_max = N_max,
+    power = power, type1 = type1)
+}
+
+fit <- bo_calibrate(
+  sim_fun     = weighted_simulator,
+  bounds      = bounds,
+  objective   = "weighted_EN_N",                 # name of a returned metric
+  constraints = list(power = c("ge", 0.80),      # constraint names must also
+                     type1 = c("le", 0.10)),     # be returned-metric names
+  budget = 300, seed = 2025)
+```
+
+To sweep philosophies, vary `w_N`/`w_0`/`w_1` per the table above and re-run
+(this is what `bo_calibrate_philosophies()` automates over a grid of weights).
 
 ## Multi-Stage Warm-Start Workflow
 
@@ -671,13 +707,15 @@ testthat::test_file("tests/testthat/test-BATON-core.R")
   author  = {Rashid, Naim},
   journal = {Journal of the American Statistical Association},
   year    = {2026},
-  note    = {R package version 0.3.0, \url{https://github.com/naimurashid/BATON}}
+  note    = {R package version 0.4.0, \url{https://github.com/naimurashid/BATON}}
 }
 ```
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+Copyright (c) 2026, The University of North Carolina at Chapel Hill. For
+not-for-profit research and educational use only; all other rights reserved.
+See LICENSE. For commercial licensing, contact otc@unc.edu.
 
 ## Contact
 

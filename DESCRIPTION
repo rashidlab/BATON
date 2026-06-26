@@ -28,7 +28,8 @@ Suggests:
     knitr,
     rmarkdown,
     microbenchmark,
-    sensitivity
+    sensitivity,
+    parallel
 VignetteBuilder: knitr
 URL: https://github.com/naimurashid/BATON
 BugReports: https://github.com/naimurashid/BATON/issues

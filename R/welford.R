@@ -158,6 +158,8 @@ welford_mean_var <- function(sample_fn, n_samples, ...) {
 #' n_rep <- 10000
 #'
 #' # Run simulations in parallel chunks
+#' # NOTE: mclapply() is POSIX-only (no forking on Windows). Windows users should
+#' # use a PSOCK cluster (parallel::makeCluster() + parLapply()) or plain lapply().
 #' chunk_results <- mclapply(1:n_cores, function(core_id) {
 #'   chunk_size <- n_rep / n_cores
 #'   welford_mean_var(
