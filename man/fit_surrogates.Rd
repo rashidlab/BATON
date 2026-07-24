@@ -10,7 +10,8 @@ fit_surrogates(
   constraint_tbl,
   covtype = "matern5_2",
   use_hetgp = TRUE,
-  prev_surrogates = NULL
+  prev_surrogates = NULL,
+  fit_seed = NULL
 )
 }
 \arguments{
@@ -30,6 +31,12 @@ heteroskedastic GP with replicated observations. Default TRUE.}
 \item{prev_surrogates}{optional list of surrogates from previous iteration
 for warm-starting hyperparameter optimization. If provided, uses previous
 hyperparameters as initial values, reducing optimization time by 30-50\%.}
+
+\item{fit_seed}{optional integer base seed for reproducible hyperparameter
+fitting. When supplied, each metric's fit runs under a deterministic seed
+(`fit_seed` + metric index), making results identical regardless of core
+count when fits are parallelised via `options(BATON.cores)`. `NULL` (default)
+leaves the RNG untouched.}
 }
 \value{
 A named list of fitted surrogate models (GP objects).

@@ -12,7 +12,8 @@ plot_init_convergence(checkpoints, threshold = 0.1)
 \item{threshold}{Convergence threshold (for reference line)}
 }
 \value{
-ggplot object (if ggplot2 available) or NULL
+ggplot object, or NULL (invisibly) with fewer than 2 checkpoints.
+  Errors if ggplot2 is not installed.
 }
 \description{
 Creates diagnostic plots showing how metrics evolved during initialization.

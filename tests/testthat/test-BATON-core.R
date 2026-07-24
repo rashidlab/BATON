@@ -1,12 +1,11 @@
 skip_on_cran()
 skip_if_not_installed("DiceKriging")
-skip_if_not_installed("DiceOptim")
 skip_if_not_installed("lhs")
 skip_if_not_installed("hetGP")
 
 toy_sim_fun <- function(theta, fidelity = c("low", "med", "high"), seed = 123, n_rep = NULL, ...) {
   fidelity <- match.arg(fidelity)
-  x <- purrr::map_dbl(theta, as.numeric)
+  x <- vapply(theta, as.numeric, numeric(1))
   noise <- dplyr::case_when(
     fidelity == "low" ~ 0.02,
     fidelity == "med" ~ 0.01,

@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Normalise user-supplied constraint specification
 #' @keywords internal
 parse_constraints <- function(constraints) {
@@ -10,16 +7,32 @@ parse_constraints <- function(constraints) {
   if (!is.list(constraints)) {
     stop("`constraints` must be a named list.", call. = FALSE)
   }
-  # Use base R vapply instead of purrr::map_chr/map_dbl to avoid "In index: X" errors
+  # Names are mandatory: an unnamed list would silently drop the metric column
+  # and fail far downstream with an opaque error.
   constraint_names <- names(constraints)
+  if (is.null(constraint_names) || any(constraint_names == "" | is.na(constraint_names))) {
+    stop("`constraints` must be a named list mapping metric name -> c(direction, threshold).",
+         call. = FALSE)
+  }
+  # Use base R vapply instead of purrr::map_chr/map_dbl to avoid "In index: X" errors
   directions <- vapply(constraints, function(x) {
+    if (length(x) < 2L) {
+      stop("Each constraint must be c(direction, threshold).", call. = FALSE)
+    }
     dir <- x[[1]]
     if (!dir %in% c("ge", "le")) {
       stop("Constraint directions must be 'ge' or 'le'.", call. = FALSE)
     }
     dir
   }, FUN.VALUE = character(1))
-  thresholds <- vapply(constraints, function(x) as.numeric(x[[2]]), FUN.VALUE = numeric(1))
+  thresholds <- vapply(constraints, function(x) {
+    thr <- suppressWarnings(as.numeric(x[[2]]))
+    if (is.na(thr) || !is.finite(thr)) {
+      stop(sprintf("Constraint threshold '%s' is not a finite number.", x[[2]]),
+           call. = FALSE)
+    }
+    thr
+  }, FUN.VALUE = numeric(1))
 
   tibble::tibble(
     metric = constraint_names,
@@ -40,8 +53,12 @@ is_feasible <- function(metrics, constraint_tbl) {
     direction <- constraint_tbl$direction[i]
     threshold <- constraint_tbl$threshold[i]
 
-    value <- metrics[[metric]]
-    if (is.null(value) || is.na(value)) {
+    # metrics may be an atomic named vector OR a list; `[[` on an atomic vector
+    # throws "subscript out of bounds" for a missing name instead of returning
+    # NULL, so guard the lookup explicitly. A missing/NA metric is treated as
+    # infeasible (conservative).
+    value <- if (metric %in% names(metrics)) metrics[[metric]] else NULL
+    if (is.null(value) || length(value) == 0 || is.na(value)) {
       return(FALSE)
     }
     if (direction == "ge") {

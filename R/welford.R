@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Compute mean and variance incrementally using Welford's algorithm
 #'
 #' This function provides a memory-efficient way to compute sample means and
@@ -99,6 +96,17 @@ welford_mean_var <- function(sample_fn, n_samples, ...) {
                      i, length(x), n_metrics), call. = FALSE)
       }
 
+      # Match metrics by NAME, not position: if the sampler returns names in a
+      # different order, positional arithmetic would silently corrupt the
+      # running mean/variance. Reorder to the first sample's names.
+      if (!is.null(metric_names) && !is.null(names(x))) {
+        if (!setequal(names(x), metric_names)) {
+          stop(sprintf("Sample %d has different metric names than the first sample.", i),
+               call. = FALSE)
+        }
+        x <- x[metric_names]
+      }
+
       # Welford's online update
       delta <- as.numeric(x) - mean_vec
       mean_vec <- mean_vec + delta / i
@@ -194,13 +202,20 @@ pool_welford_results <- function(chunk_results) {
   # Start with first chunk
   pooled_mean <- chunk_results[[1]]$mean
   pooled_n <- chunk_results[[1]]$n
-  pooled_M2 <- chunk_results[[1]]$M2 %||%
-    (chunk_results[[1]]$variance * pooled_n * (pooled_n - 1))
+  # Reconstruct M2 (sum of squared deviations) from variance-of-the-mean:
+  # M2 = variance * n * (n-1). A single-observation chunk (n=1) has M2=0 by
+  # definition; its variance is NA, so the formula would yield NA and poison the
+  # whole pooled result - special-case it.
+  reconstruct_M2 <- function(chunk) {
+    if (!is.null(chunk$M2)) return(chunk$M2)
+    if (chunk$n > 1) chunk$variance * chunk$n * (chunk$n - 1) else 0 * chunk$mean
+  }
+  pooled_M2 <- reconstruct_M2(chunk_results[[1]])
 
   # Sequentially combine remaining chunks using Chan's algorithm
   for (i in 2:length(chunk_results)) {
     chunk <- chunk_results[[i]]
-    chunk_M2 <- chunk$M2 %||% (chunk$variance * chunk$n * (chunk$n - 1))
+    chunk_M2 <- reconstruct_M2(chunk)
 
     # Chan's parallel variance formula
     delta <- chunk$mean - pooled_mean

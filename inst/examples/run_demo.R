@@ -1,7 +1,9 @@
 
 # Example of BATON API
 library(BATON)
-sim_fun <- function(theta, fidelity=c("low","high")) {
+sim_fun <- function(theta, fidelity=c("low","med","high"), seed=NULL, n_rep=NULL, ...) {
+  # n_rep is the replication count BATON asks for (fidelity_levels[fidelity]);
+  # a real simulator would run that many trial replicates
   c(power=0.85, type1=0.08, EN=150, ET=20)
 }
 bounds <- list(eff=c(0.8,0.99), fut=c(0.05,0.3), ev=c(5,50), nmax=c(120,240))

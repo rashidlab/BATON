@@ -651,15 +651,20 @@ test_that("best_feasible_objective returns finite value with only low-fidelity d
   expect_equal(boi_value, 0.05,
                info = "BOI should return min objective among feasible rows")
 
-  # ---- Verify the old bug: high_fidelity_only = TRUE gives Inf ----
-  buggy_value <- BATON:::best_feasible_objective(
+  # ---- A8: high_fidelity_only = TRUE with no HF data now falls back ----
+  # Previously this returned Inf (the Bug #6 symptom, avoided at the call site by
+  # passing high_fidelity_only dynamically). Task A8 makes the function itself
+  # robust: with no feasible high-fidelity eval it falls back to the any-fidelity
+  # feasible best rather than Inf, so a stray hardcoded TRUE can no longer flip
+  # acquisition into no-feasible mode.
+  fallback_value <- BATON:::best_feasible_objective(
     history, "EN",
     surrogates = NULL,
-    high_fidelity_only = TRUE,  # Hardcoded TRUE — the old bug
+    high_fidelity_only = TRUE,
     incumbent_method = "boi"
   )
-  expect_equal(buggy_value, Inf,
-               info = "Hardcoded high_fidelity_only=TRUE should return Inf (no HF data)")
+  expect_equal(fallback_value, 0.05,
+               info = "A8: high_fidelity_only=TRUE with no HF data falls back to any-fidelity feasible best")
 
   # ---- Verify that adding high-fidelity data restores HF-only behavior ----
   history_with_hf <- tibble::add_row(
@@ -753,4 +758,115 @@ test_that("BPM and BOI incumbents produce divergent BO histories (single-fidelit
     expect_false(identical(bo_bpm, bo_boi),
                  info = "BPM and BOI should produce different acquisition sequences")
   }
+})
+
+# ============================================================================
+# Doc-review fix 1: misnamed objective must give the friendly error, not
+# "subscript out of bounds", for the documented named-numeric-vector contract
+# ============================================================================
+
+test_that("misnamed objective errors cleanly for vector-returning simulators", {
+  skip_if_not_installed("lhs")
+
+  vec_sim <- function(theta, fidelity = "low", seed = NULL, ...) {
+    c(power = 0.9, EN = 40)
+  }
+
+  expect_error(
+    bo_calibrate(
+      sim_fun = vec_sim,
+      bounds = list(x1 = c(0, 1)),
+      objective = "EN_missing",
+      constraints = list(power = c("ge", 0.8)),
+      n_init = 2,
+      q = 1,
+      budget = 2,
+      progress = FALSE
+    ),
+    "not returned by simulator"
+  )
+})
+
+test_that("misnamed objective errors cleanly for list-returning simulators", {
+  skip_if_not_installed("lhs")
+
+  list_sim <- function(theta, fidelity = "low", seed = NULL, ...) {
+    list(power = 0.9, EN = 40)
+  }
+
+  expect_error(
+    bo_calibrate(
+      sim_fun = list_sim,
+      bounds = list(x1 = c(0, 1)),
+      objective = "EN_missing",
+      constraints = list(power = c("ge", 0.8)),
+      n_init = 2,
+      q = 1,
+      budget = 2,
+      progress = FALSE
+    ),
+    "not returned by simulator"
+  )
+})
+
+# ============================================================================
+# Doc-review fix 2: benchmark_methods must reject bo_calibrate arguments
+# arriving via ... instead of bo_args (silent no-op / collision trap)
+# ============================================================================
+
+test_that("benchmark_methods rejects bo_calibrate args passed via dots", {
+  expect_error(
+    benchmark_methods(
+      sim_fun = mock_sim,
+      bounds = list(x1 = c(0, 1), x2 = c(0, 1)),
+      objective = "EN",
+      constraints = list(power = c("ge", 0.8)),
+      strategies = "random",
+      budget = 100
+    ),
+    "bo_args"
+  )
+
+  expect_error(
+    benchmark_methods(
+      sim_fun = mock_sim,
+      bounds = list(x1 = c(0, 1), x2 = c(0, 1)),
+      objective = "EN",
+      constraints = list(power = c("ge", 0.8)),
+      strategies = "bo",
+      n_init = 5,
+      seed = 1
+    ),
+    "bo_args"
+  )
+
+  # 'seed' alone gets the seed-specific hint pointing at seeds = c(...)
+  expect_error(
+    benchmark_methods(
+      sim_fun = mock_sim,
+      bounds = list(x1 = c(0, 1), x2 = c(0, 1)),
+      objective = "EN",
+      constraints = list(power = c("ge", 0.8)),
+      strategies = "random",
+      seed = 1
+    ),
+    "seeds"
+  )
+})
+
+test_that("benchmark_methods still works with args inside bo_args/random_args", {
+  skip_on_cran()
+
+  bench <- benchmark_methods(
+    sim_fun = mock_sim,
+    bounds = list(x1 = c(0, 1), x2 = c(0, 1)),
+    objective = "EN",
+    constraints = list(power = c("ge", 0.8)),
+    strategies = "random",
+    random_args = list(n_samples = 3, seeds = 1),
+    simulators_per_eval = list(random = 100),
+    progress = FALSE
+  )
+  expect_s3_class(bench, "BATON_benchmark")
+  expect_equal(nrow(bench$results), 1L)
 })

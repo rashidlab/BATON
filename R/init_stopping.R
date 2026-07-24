@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 # init_stopping.R
 # GP-Based Initialization Stopping for Bayesian Optimization
 #
@@ -257,10 +254,14 @@ check_metric_convergence <- function(current, previous, window, threshold, verbo
 #'
 #' @param X Design matrix to extract bounds from
 #' @param n Number of test points
+#' @param use_sobol Logical: use a randtoolbox Sobol sequence (default: TRUE
+#'   when randtoolbox is installed). Exposed as an argument so the random
+#'   fallback branch is testable without mocking `requireNamespace`.
 #'
 #' @return Matrix of test points (n x d)
 #' @keywords internal
-generate_test_grid <- function(X, n = 200) {
+generate_test_grid <- function(X, n = 200,
+                               use_sobol = requireNamespace("randtoolbox", quietly = TRUE)) {
   d <- ncol(X)
   lower <- apply(X, 2, min)
   upper <- apply(X, 2, max)
@@ -270,11 +271,14 @@ generate_test_grid <- function(X, n = 200) {
   lower <- lower - 0.05 * range_vec
   upper <- upper + 0.05 * range_vec
 
-  # Generate Sobol sequence (or fallback to random)
-  if (requireNamespace("randtoolbox", quietly = TRUE)) {
+  # Generate Sobol sequence (or fallback to random). randtoolbox lives in
+  # Suggests (Task D9), so the fallback is live code on hosts without it:
+  # say so, since two machines with identical seeds can otherwise silently
+  # produce different init-stopping decisions.
+  if (use_sobol) {
     sobol_01 <- randtoolbox::sobol(n, dim = d)
   } else {
-    # Fallback: stratified random
+    message("randtoolbox not installed; using a random test grid for init stopping (results may differ from Sobol-based runs).")
     sobol_01 <- matrix(runif(n * d), nrow = n, ncol = d)
   }
 
@@ -491,17 +495,14 @@ run_init_with_stopping <- function(
 #' @param checkpoints List of checkpoint metrics from check_init_sufficiency()
 #' @param threshold Convergence threshold (for reference line)
 #'
-#' @return ggplot object (if ggplot2 available) or NULL
+#' @return ggplot object, or NULL (invisibly) with fewer than 2 checkpoints.
+#'   Errors if ggplot2 is not installed.
 #' @export
 plot_init_convergence <- function(checkpoints, threshold = 0.10) {
+  require_suggests("ggplot2")
 
   if (length(checkpoints) < 2) {
     message("Need at least 2 checkpoints to plot")
-    return(invisible(NULL))
-  }
-
-  if (!requireNamespace("ggplot2", quietly = TRUE)) {
-    message("ggplot2 required for plotting")
     return(invisible(NULL))
   }
 

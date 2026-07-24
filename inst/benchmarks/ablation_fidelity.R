@@ -18,7 +18,6 @@
 library(BATON)
 library(dplyr)
 library(ggplot2)
-library(tidyr)
 
 # Load test problems
 source("inst/benchmarks/test_problems.R")

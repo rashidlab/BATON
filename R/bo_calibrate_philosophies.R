@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 # BATON v0.4.0 batch wrapper: calibrate multiple design philosophies for a
 # single scenario in dependency order, with cross-philosophy warmstart and
 # multi-seed verification both enabled by default.
@@ -67,12 +64,17 @@
 #' @return A list with class `BATON_batch_fit` and elements:
 #'   \itemize{
 #'     \item \code{scenario_id}: as supplied
-#'     \item \code{fits}: named list of `BATON_fit` objects, one per philosophy
+#'     \item \code{fits}: named list of `BATON_fit` objects, one per philosophy.
+#'       A philosophy whose calibration errors is not fatal to the batch: its
+#'       entry is an errored fit with `status = "errored"`, `error_message`
+#'       (the message; `error` is kept as a back-compat alias),
+#'       `best_theta = NULL`, and an empty `history` tibble.
 #'     \item \code{manifest}: data frame with columns
 #'       `philosophy`, `dependency_role` ("donor" or "recipient"), `verdict`
 #'       (`"MULTI_SEED_PASS"` / `"MULTI_SEED_FAIL"` / `"MULTI_SEED_WARN"` /
-#'       `NA_character_`), `n_max`, `objective_value`,
-#'       `warmstart_donors` (semi-colon-separated names), runtime_s
+#'       `"ERRORED"` for a failed calibration / `NA_character_`), `n_max`,
+#'       `objective_value`, `warmstart_donors` (semi-colon-separated names),
+#'       runtime_s
 #'   }
 #' @export
 bo_calibrate_philosophies <- function(scenario_id,
@@ -132,12 +134,46 @@ bo_calibrate_philosophies <- function(scenario_id,
   fits <- list()
   manifest_rows <- list()
 
+  # Isolate each philosophy's calibration: a failure in one must not discard the
+  # other (often multi-hour) completed fits. On error, record an errored fit and
+  # continue; downstream (warmstart specs, multi-seed filter, manifest) already
+  # treats a fit with NULL best_theta / verdict "ERRORED" gracefully.
+  safe_bo_calibrate <- function(name, role, ...) {
+    tryCatch(
+      bo_calibrate(...),
+      error = function(e) {
+        warning(sprintf("[%s | %s pass] calibration FAILED: %s",
+                        name, role, conditionMessage(e)), call. = FALSE)
+        fit <- build_baton_fit(
+          history = initialise_history(),
+          best_theta = NULL,
+          best_objective = NA_real_,
+          surrogates = NULL,
+          policies = NULL,
+          diagnostics = NULL,
+          multi_seed_summary = NULL,
+          multi_seed_runs = NULL,
+          verdict = "ERRORED",
+          bounds = NULL,
+          constraints = NULL,
+          constraint_tbl = NULL,
+          status = "errored",
+          error_message = conditionMessage(e)
+        )
+        # Back-compat alias; TODO(v0.8): drop, nothing in-package reads $error
+        fit$error <- fit$error_message
+        fit
+      }
+    )
+  }
+
   # Pass 1: calibrate donors (no warmstart)
   for (name in donors) {
     p <- philosophies[[name]]
     t0 <- Sys.time()
     message(sprintf("[%s | donor pass] starting calibration", name))
-    fit <- bo_calibrate(
+    fit <- safe_bo_calibrate(
+      name, "donor",
       sim_fun = sim_fun,
       bounds = bounds,
       objective = p$objective,
@@ -174,14 +210,41 @@ bo_calibrate_philosophies <- function(scenario_id,
     theta <- donor_fit$best_theta
     if (is.null(theta) || length(theta) == 0) return(NULL)
     spec <- as.data.frame(as.list(unlist(theta)))
-    # Look up the donor's high-fidelity verified OCs from its history
-    # (final feasible eval at high fidelity, if any).
+    # Attach the OCs of best_theta's OWN evaluation. Match by theta_id (the same
+    # hash used to build history) so the seeded (theta, metrics) pair is
+    # consistent; only if that lookup fails do we fall back to the last
+    # high-fidelity feasible row. (Previously the code always used the last
+    # high-fid feasible row, which need not be best_theta's evaluation, seeding
+    # the recipient surrogate with a mismatched design/OC pair.)
     h <- donor_fit$history
     if (!is.null(h) && nrow(h) > 0) {
-      hf_idx <- which(h$fidelity == "high" & h$feasible)
-      if (length(hf_idx) > 0) {
-        last_hf <- tail(hf_idx, 1)
-        donor_metrics <- h$metrics[[last_hf]]
+      row_idx <- NA_integer_
+      bound_names <- intersect(names(theta), names(bounds))
+      if (length(bound_names) == length(bounds) && "theta_id" %in% names(h)) {
+        best_id <- theta_to_id(scale_to_unit(theta[bound_names], bounds))
+        matched <- which(h$theta_id == best_id)
+        if (length(matched) > 0) {
+          # best_theta may have been evaluated more than once (e.g. low then high
+          # fidelity). Prefer the high-fidelity feasible evaluation, then any
+          # feasible one, so we attach the OCs that actually characterize it -
+          # not a chronologically-later low-fidelity or infeasible re-eval.
+          hf_feas <- matched[which(h$fidelity[matched] == "high" & h$feasible[matched])]
+          feas <- matched[which(h$feasible[matched])]
+          row_idx <- if (length(hf_feas) > 0) {
+            tail(hf_feas, 1)
+          } else if (length(feas) > 0) {
+            tail(feas, 1)
+          } else {
+            tail(matched, 1)
+          }
+        }
+      }
+      if (is.na(row_idx)) {
+        hf_idx <- which(h$fidelity == "high" & h$feasible)
+        if (length(hf_idx) > 0) row_idx <- tail(hf_idx, 1)
+      }
+      if (!is.na(row_idx)) {
+        donor_metrics <- h$metrics[[row_idx]]
         for (m in names(donor_metrics)) {
           spec[[m]] <- as.numeric(donor_metrics[[m]])
         }
@@ -231,7 +294,8 @@ bo_calibrate_philosophies <- function(scenario_id,
       name, length(warmstart_specs),
       paste(eligible_donors[seq_along(warmstart_specs)], collapse = ", ")
     ))
-    fit <- bo_calibrate(
+    fit <- safe_bo_calibrate(
+      name, "recipient",
       sim_fun = sim_fun,
       bounds = bounds,
       objective = p$objective,

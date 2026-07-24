@@ -1,7 +1,7 @@
 Package: BATON
 Type: Package
 Title: Bayesian Optimization for Calibration of Adaptive Clinical Trials
-Version: 0.4.0
+Version: 0.7.0
 Authors@R:
     person(given = "Naim", family = "Rashid", role = c("aut", "cre"),
            email = "naim_rashid@unc.edu",
@@ -12,16 +12,11 @@ Depends: R (>= 4.2)
 Imports:
     DiceKriging,
     lhs,
-    randtoolbox,
-    ggplot2,
     methods,
     stats,
     utils,
     dplyr,
-    purrr,
     tibble,
-    tidyr,
-    rlang,
     hetGP
 Suggests:
     testthat,
@@ -29,10 +24,12 @@ Suggests:
     rmarkdown,
     microbenchmark,
     sensitivity,
-    parallel
+    parallel,
+    ggplot2,
+    randtoolbox
 VignetteBuilder: knitr
 URL: https://github.com/rashidlab/BATON
 BugReports: https://github.com/rashidlab/BATON/issues
 Encoding: UTF-8
 LazyData: true
-RoxygenNote: 7.3.3
+Config/roxygen2/version: 8.0.0

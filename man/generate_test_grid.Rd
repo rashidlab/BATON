@@ -4,12 +4,20 @@
 \alias{generate_test_grid}
 \title{Generate Test Grid for Variance Computation}
 \usage{
-generate_test_grid(X, n = 200)
+generate_test_grid(
+  X,
+  n = 200,
+  use_sobol = requireNamespace("randtoolbox", quietly = TRUE)
+)
 }
 \arguments{
 \item{X}{Design matrix to extract bounds from}
 
 \item{n}{Number of test points}
+
+\item{use_sobol}{Logical: use a randtoolbox Sobol sequence (default: TRUE
+when randtoolbox is installed). Exposed as an argument so the random
+fallback branch is testable without mocking `requireNamespace`.}
 }
 \value{
 Matrix of test points (n x d)

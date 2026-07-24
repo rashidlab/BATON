@@ -35,7 +35,7 @@ trial calibration:
    (sole objective: minimize $E_0[N]$) terminated at $E_0[N] = 67.19$,
    while a Fleming calibration with $w_0 = 0.5$ terminated at
    $E_0[N] = 66.18$. Fleming Pareto-dominated Optimal under Optimal's own
-   loss — a calibration artifact attributable to BO settling at a local
+   loss, a calibration artifact attributable to BO settling at a local
    minimum in the 9-parameter design space. Seeding Stage 0 with
    Fleming's top-3 high-fidelity verified designs recovered Optimal at
    $E_0[N] = 65.66$, strictly better than both prior calibrations.
@@ -43,7 +43,7 @@ trial calibration:
 2. **Stored-vs-actual gaps.** Three SYMM cohortA bidirectional designs
    had calibration-time stored type-I error below the 0.10 regulatory
    floor but multi-seed verification (5 seeds × R = 10,000 each)
-   revealed multi-seed type-I error in [0.122, 0.170] — stored-vs-actual
+   revealed multi-seed type-I error in [0.122, 0.170]: stored-vs-actual
    gaps of approximately 0.075, more than 20 Monte Carlo standard
    errors. Without multi-seed verification, those designs would have
    shipped type-I-inflated.
@@ -196,6 +196,11 @@ batch$manifest
 #> 5  Alt-Optimal       recipient MULTI_SEED_PASS    51         16.260   Fleming;Minimax;Admissible  1342.1
 ```
 
+If one philosophy's calibration errors, the batch continues: that
+philosophy's entry in `batch$fits` is an errored fit with
+`status = "errored"` and the failure message in `error_message` (the
+`error` field is kept as a back-compat alias).
+
 ## Backward compatibility
 
 All v0.4.0 changes are additive and opt-in. Existing calls to
@@ -230,7 +235,7 @@ All v0.4.0 changes are additive and opt-in. Existing calls to
    - Warmstart from a sibling philosophy via `warmstart_from`.
    - Switch random seed and rerun.
 5. **Document which BO seed produced which design.** BO under wide
-   bounds with bounded budget exhibits restart variance — running the
+   bounds with bounded budget exhibits restart variance: running the
    same calibration with a different seed can produce a different
    calibrated design. Multi-seed verification certifies the seeds the
    calibration was tested at, not all possible seeds.

@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 # bo_warmstart.R
 # Warm-starting and parameter refinement for Bayesian Optimization
 #
@@ -229,13 +226,25 @@ fix_parameters <- function(sim_fun, fixed_params, original_bounds) {
   }
   cat("\n")
 
-  # Create wrapper function
-  wrapper <- function(theta, fidelity = c("low", "med", "high"), seed = 2025, ...) {
+  # Create wrapper function. It declares n_rep so BATON's optional n_rep
+  # contract reaches through the wrapper, but forwards it only when the
+  # wrapped simulator itself declares an n_rep formal (a legacy simulator
+  # without one must not receive an unexpected argument).
+  inner_accepts_n_rep <- "n_rep" %in% names(formals(sim_fun))
+  wrapper <- function(theta, fidelity = c("low", "med", "high"), seed = 2025,
+                      n_rep = NULL, ...) {
     # Inject fixed parameters
     theta_full <- c(as.list(theta), as.list(fixed_params))
 
-    # Call original simulator
-    result <- sim_fun(theta = theta_full, fidelity = fidelity, seed = seed, ...)
+    # Call original simulator. Forward n_rep only when the caller actually
+    # supplied one: forwarding the wrapper's NULL default would override a
+    # non-NULL default declared by the inner simulator.
+    if (inner_accepts_n_rep && !is.null(n_rep)) {
+      result <- sim_fun(theta = theta_full, fidelity = fidelity, seed = seed,
+                        n_rep = n_rep, ...)
+    } else {
+      result <- sim_fun(theta = theta_full, fidelity = fidelity, seed = seed, ...)
+    }
 
     return(result)
   }

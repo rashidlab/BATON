@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Calibrate adaptive trial designs with constrained Bayesian optimisation
 #'
 #' Implements the methodology described in Section 2 of the manuscript:
@@ -28,6 +25,15 @@
 #'   replications) for best results. If `variance` is not provided, a binomial
 #'   approximation is used for metrics in [0,1], and a small nugget is used for
 #'   other metrics.
+#'
+#'   Optionally, the simulator may declare an explicit `n_rep` argument. When
+#'   it does, BATON passes the requested replication count
+#'   `n_rep = fidelity_levels[[fidelity]]` (including dynamically escalated
+#'   values under `fidelity_method = "hybrid_staged"`), so the simulator can
+#'   honor the exact budget rather than re-deriving it from the fidelity
+#'   label. Accepting `...` alone does NOT opt in (this keeps wrappers that
+#'   forward `...` to legacy simulators working); simulators without an
+#'   `n_rep` formal are called exactly as before (backward compatible).
 #' @param bounds named list of length-two numeric vectors specifying lower and
 #'   upper limits for each design parameter.
 #' @param objective name of the operating characteristic to minimise (character).
@@ -40,15 +46,27 @@
 #'   applied via local penalization (v0.3.0) to ensure spatially diverse points.
 #' @param budget total number of simulator evaluations (initial + BO iterations).
 #'   Default 300 (increased from 150 for tight constraint spaces).
-#' @param seed base RNG seed for reproducibility.
-#' @param initial_history optional data frame of previous evaluations to use as
-#'   initialization instead of random Latin hypercube sampling. If provided,
-#'   \code{n_init} is ignored and the BO loop starts immediately with this data.
-#'   Must contain columns for all parameters in \code{bounds}, plus \code{objective},
-#'   \code{fidelity}, \code{feasible}, and individual constraint metric columns.
-#'   All rows must be within the specified \code{bounds}. This enables multi-stage
-#'   warm-starting where later stages reuse evaluations from previous stages with
-#'   narrowed bounds. Default: NULL (use random initialization).
+#' @param seed base RNG seed for reproducibility. With an explicit seed the
+#'   caller's RNG stream is restored on exit (success or error), so calling
+#'   `bo_calibrate()` never advances `.Random.seed` in the calling
+#'   environment. With `seed = NULL` the run seed is drawn from the caller's
+#'   stream via a single `sample.int(1e6, 1)` draw that legitimately advances
+#'   the stream by exactly one step (everything else is still rewound), so
+#'   repeated `seed = NULL` calls give independent replicates. The seed
+#'   actually used is recorded in `fit$policies$seed`.
+#' @param initial_history optional data frame of previous evaluations to seed
+#'   the initial design. Must contain columns for all parameters in
+#'   \code{bounds}, plus \code{objective}, \code{fidelity}, \code{feasible},
+#'   and individual constraint metric columns. All rows must be within the
+#'   specified \code{bounds}. The provided rows AUGMENT the
+#'   Latin hypercube initial design: if fewer than \code{n_init} rows are
+#'   supplied, fresh LHS points (deduplicated against the provided
+#'   \code{theta_id}s) top up the design to \code{n_init} before the BO loop
+#'   starts, so a handful of donor seeds no longer replaces the whole initial
+#'   design. With \code{n_init} or more rows, no LHS points are added and the
+#'   BO loop starts immediately with this data (multi-stage warm-starting
+#'   where later stages reuse evaluations from previous stages with narrowed
+#'   bounds). Default: NULL (LHS-only initialization).
 #' @param init_stopping optional list controlling GP-based initialization early
 #'   stopping. When enabled, a Gaussian process is fit periodically during
 #'   initialization to assess whether the design space is sufficiently explored.
@@ -117,8 +135,18 @@
 #'       reset patience counter (default: 1e-3 = 0.1\%)}
 #'     \item{\code{consecutive}}{Integer: number of consecutive patience windows
 #'       showing no improvement required to trigger stop (default: 2)}
+#'     \item{\code{acq_rel}}{Numeric: acquisition-flatline stop threshold
+#'       (default: 1e-3). Optimization also stops when the maximum acquisition
+#'       value of the selected batch stays below a small level for several
+#'       consecutive iterations. Once a feasible incumbent exists the acquisition
+#'       is expected constrained improvement (EI * P(feasible)) and the level is
+#'       \code{acq_rel * |incumbent|}, so the criterion scales with the objective
+#'       (consistent whether it is O(1) or O(100)); before any feasible point the
+#'       acquisition is the exploration/expected-violation score and the level is
+#'       simply \code{acq_rel}.}
 #'   }
-#'   Default: NULL (uses default values: patience=5, threshold=1e-3, consecutive=2).
+#'   Default: NULL (uses default values: patience=5, threshold=1e-3,
+#'   consecutive=2, acq_rel=1e-3).
 #'   Set \code{early_stop = list(enabled = FALSE)} to disable early stopping entirely.
 #' @param incumbent_method method for computing the incumbent (best feasible) value
 #'   used in the ECI acquisition function. Options:
@@ -132,6 +160,110 @@
 #'   }
 #'   See Srinivas et al. (2024) "Bayesian Optimization with Expected Improvement:
 #'   No Regret and the Choice of Incumbent" for theoretical analysis.
+#' @param max_walltime_s optional walltime cap in seconds (default `NULL`, no
+#'   cap). Elapsed time is measured from function entry and checked between
+#'   initial-design evaluation chunks and at the top of each BO iteration, so
+#'   the cap is advisory (chunk/iteration-granular), not preemptive: a running
+#'   chunk or batch is never interrupted, and the run may overshoot the cap by
+#'   up to one chunk or one full iteration (surrogate fit plus `q` simulator
+#'   evaluations). When the cap trips, the function returns normally with a
+#'   partial but internally consistent fit whose `status` field is
+#'   `"walltime"`. If the cap is first crossed on a final chunk or batch that
+#'   simultaneously ends the run for another reason (e.g. the budget is
+#'   exhausted), `status` records that reason instead. In either case, once
+#'   the cap has been reached, Stage 4 multi-seed verification is skipped
+#'   even when `multi_seed_verify = TRUE`.
+#' @param callback optional function invoked once at the END of each BO
+#'   iteration (after the batch has been evaluated and recorded; it is NOT
+#'   invoked during the initial design phase). It receives a single list with
+#'   fields:
+#'   \describe{
+#'     \item{\code{iter}}{Current BO iteration number (1-based).}
+#'     \item{\code{eval_count}}{Total evaluations recorded so far (including
+#'       the initial design and any donor rows).}
+#'     \item{\code{best_objective}}{Best feasible objective value known at the
+#'       start of the iteration (the ECI incumbent), or `NA_real_` if no
+#'       feasible point exists yet. Under the default incumbent method
+#'       (`"bpm"`) this may be surrogate-predicted (a GP posterior mean), not
+#'       necessarily an observed value.}
+#'     \item{\code{best_observed}}{Best observed feasible objective by row,
+#'       including the just-completed batch, or `NA_real_` if no feasible
+#'       point exists yet.}
+#'     \item{\code{elapsed_s}}{Seconds elapsed since function entry.}
+#'   }
+#'   Contract: return `TRUE` to continue; any other return value cancels the
+#'   run cooperatively AFTER the current iteration (no mid-batch interruption,
+#'   no completed work discarded) and the returned fit has `status`
+#'   `"cancelled"`. A logging-only callback must therefore return `TRUE` as
+#'   its final expression (e.g. call `message(info$iter)` and then `TRUE`).
+#'   An error raised by
+#'   the callback produces a warning and the
+#'   run continues (a monitoring hook must not kill a paid run). A cancelled
+#'   run skips Stage 4 multi-seed verification even when
+#'   `multi_seed_verify = TRUE`. If the callback cancels on the final
+#'   iteration (one that simultaneously ends the run because the budget is
+#'   exhausted), `status` records `"cancelled"` rather than
+#'   `"budget_exhausted"`, and Stage 4 verification is skipped. Default
+#'   `NULL` (no callback).
+#' @param checkpoint_fun optional function invoked with a slim, resumable
+#'   `BATON_fit` snapshot (`status = "checkpoint"`) every `checkpoint_every`
+#'   completed BO iterations (iteration-granular, not per-evaluation; the
+#'   initial design phase emits no checkpoints). Snapshots carry the full
+#'   evaluation `history`, the observed feasible best so far (`best_theta`
+#'   is `NULL` and `best_objective` is `NA_real_` before feasibility), and
+#'   the run's `policies`, but `surrogates` and `diagnostics` are `NULL`:
+#'   GP objects are large, environment-laden, and not needed to resume. To
+#'   resume from a saved checkpoint `ckpt`, pass its history back in:
+#'   `bo_calibrate(..., initial_history = ckpt$history,
+#'   n_init = nrow(ckpt$history))`; keeping `n_init <= nrow(ckpt$history)`
+#'   avoids the donor-augmentation LHS top-up (Task B2 rule), so the resume
+#'   refits surrogates from the recorded history and continues the run. The
+#'   return value of `checkpoint_fun` is ignored; an error it raises
+#'   produces a warning and the run continues (same rationale as
+#'   `callback`). Default `NULL` (no checkpoints).
+#' @param checkpoint_every single positive integer; number of completed BO
+#'   iterations between checkpoint snapshots. Used only when
+#'   `checkpoint_fun` is supplied. Default `5L`.
+#' @param on_error one of `"stop"` (default) or `"return_partial"`. With
+#'   `"stop"`, any error raised during the run (simulator failure, surrogate
+#'   fitting failure, ...) propagates to the caller exactly as before. With
+#'   `"return_partial"`, an error inside an evaluation round or BO iteration
+#'   ends the run gracefully instead: the function returns a partial but
+#'   internally consistent `BATON_fit` with `status = "errored"` and the
+#'   condition message in `error_message`, preserving every completed
+#'   evaluation. Granularity caveat: history rows are appended once per
+#'   evaluation round (an initial-design chunk or a BO batch), so a failure
+#'   inside a round loses that round's evaluations, including any that
+#'   completed before the failing one (with parallel evaluation via
+#'   `options(BATON.cores)`, the whole failed batch); rows from all PRIOR
+#'   rounds always survive. Without a walltime cap the whole LHS initial
+#'   design is a single round, so an error there yields an empty-history
+#'   partial fit. After an in-loop error the final surrogate refit is still
+#'   attempted (in its own guard), so `surrogates` may be `NULL` in the
+#'   partial fit; Stage 4 multi-seed verification is skipped. A failure
+#'   INSIDE Stage 4 verification itself (one that escapes
+#'   `run_multi_seed_verification`'s per-seed catch) is also guarded:
+#'   the fit is returned with `status = "errored"`,
+#'   `multi_seed_summary`/`multi_seed_runs` `NULL`, and `verdict` `NA`.
+#'   Likewise a post-refit `generate_diagnostics` failure drops
+#'   `diagnostics` (with a warning) instead of losing the fit. Interrupts
+#'   (Ctrl-C) are never caught in either mode.
+#' @param slim logical; if `TRUE` the returned `BATON_fit` is a lightweight
+#'   decision object: `surrogates`, `diagnostics`, and `multi_seed_runs` are
+#'   `NULL`, while `history`, `best_theta`, `best_objective`, `policies`,
+#'   `multi_seed_summary`, `verdict`, `status`, and `error_message` are kept
+#'   (the adoption gate survives). Rationale: km/hetGP surrogate objects
+#'   carry closures and environments that inflate `saveRDS` payloads far
+#'   beyond the decision content, so a calibration service persisting many
+#'   fits wants `slim`. Because nothing else consumes the post-loop
+#'   surrogate refit (`best_theta`/`best_objective` are computed from the
+#'   history alone), `slim = TRUE` also SKIPS that final refit entirely,
+#'   saving one full GP fit per run; a side effect is that an error arising
+#'   only in the final refit cannot surface under `slim = TRUE` (the run
+#'   returns its natural status). Downstream helpers that need the fitted
+#'   surrogates (`sa_sobol()`, `sensitivity_diagnostics()`,
+#'   `extract_case_study()`) require a non-slim fit. A slim fit remains
+#'   resumable via `initial_history = fit$history`. Default `FALSE`.
 #' @param progress logical; if `TRUE` (default) messages are emitted at key
 #'   milestones.
 #' @param warmstart_from optional list of calibrated designs to inject as Stage 0
@@ -165,12 +297,27 @@
 #'
 #' @return An object of class `BATON_fit` containing the optimisation history,
 #'   best design, fitted surrogates, policy configuration, and posterior draws
-#'   supporting sensitivity diagnostics. When `multi_seed_verify = TRUE`, also
-#'   includes `multi_seed_summary` (per-seed evaluations + summary statistics)
-#'   and `verdict` (`"MULTI_SEED_PASS"` or `"MULTI_SEED_FAIL"`). Note: early
+#'   supporting sensitivity diagnostics. With `slim = TRUE` the `surrogates`,
+#'   `diagnostics`, and `multi_seed_runs` components are `NULL` (see the
+#'   `slim` argument). When `multi_seed_verify = TRUE`, also
+#'   includes `multi_seed_summary` (summary statistics), `multi_seed_runs`
+#'   (the per-seed evaluations; `NULL` under `slim = TRUE`), and `verdict`
+#'   (`"MULTI_SEED_PASS"`, `"MULTI_SEED_FAIL"` when the strict gate fails
+#'   under `multi_seed_strict = TRUE`, or `"MULTI_SEED_WARN"` when it fails
+#'   under `multi_seed_strict = FALSE`), unless the
+#'   `max_walltime_s` cap tripped or the run was cancelled via `callback`, in
+#'   which case Stage 4 verification is
+#'   skipped and `multi_seed_summary` is `NULL` with `verdict` `NA`. Note: early
 #'   stopping may terminate before \code{budget} is exhausted if convergence
 #'   is detected (configurable via \code{early_stop} parameter, default: no
-#'   improvement > 0.1\% for 5 iterations).
+#'   improvement > 0.1\% for 5 iterations). The `status` field records why
+#'   the run ended: `"budget_exhausted"` (evaluation budget consumed),
+#'   `"early_stopped"` (improvement plateau), `"acq_flatline"`
+#'   (acquisition values below the \code{acq_rel} threshold),
+#'   `"walltime"` (the \code{max_walltime_s} cap tripped between iterations),
+#'   `"cancelled"` (the \code{callback} requested cancellation at the end
+#'   of a BO iteration), or `"errored"` (an error was caught under
+#'   \code{on_error = "return_partial"}; the message is in `error_message`).
 #'
 #' @importFrom utils head tail
 #' @export
@@ -201,10 +348,39 @@ bo_calibrate <- function(sim_fun,
                          multi_seed_n = 5L,
                          multi_seed_reps = NULL,
                          multi_seed_strict = TRUE,
+                         max_walltime_s = NULL,
+                         callback = NULL,
+                         checkpoint_fun = NULL,
+                         checkpoint_every = 5L,
+                         on_error = c("stop", "return_partial"),
+                         slim = FALSE,
                          ...) {
+  # Walltime accounting (Task D4) starts at function entry so the cap covers
+  # the initial design as well as the BO loop.
+  start_time <- Sys.time()
+
+  # RNG hygiene (D3, revised in D4): restore the caller's stream on every exit
+  # path (including errors). When seed = NULL, the run seed is drawn from the
+  # caller's stream FIRST (one sample.int() draw) and the restore hook is
+  # installed immediately after, capturing the post-draw state. That single
+  # draw is the only way the caller's stream advances, so repeated
+  # seed = NULL calls give independent replicates while everything from
+  # set.seed() onward is rewound on exit. With an explicit seed no draw
+  # occurs and the caller's stream is untouched. Nothing between here and
+  # set.seed(rng_seed) below may touch the RNG. Same restore pattern as
+  # run_seeded() in R/surrogates.R.
+  rng_seed <- if (is.null(seed)) sample.int(1e6, 1) else seed
+  if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    on.exit(assign(".Random.seed", old_seed, envir = .GlobalEnv), add = TRUE)
+  } else {
+    on.exit(suppressWarnings(rm(".Random.seed", envir = .GlobalEnv)), add = TRUE)
+  }
+
   acquisition <- match.arg(acquisition)
   fidelity_method <- match.arg(fidelity_method)
   incumbent_method <- match.arg(incumbent_method)
+  on_error <- match.arg(on_error)
 
   # INPUT VALIDATION: Core parameters
   if (!is.function(sim_fun)) {
@@ -284,6 +460,48 @@ bo_calibrate <- function(sim_fun,
     warning("`budget` is less than `n_init`; only initial design will be evaluated.",
             call. = FALSE)
   }
+  if (!is.null(max_walltime_s)) {
+    if (!is.numeric(max_walltime_s) || length(max_walltime_s) != 1 ||
+        !is.finite(max_walltime_s) || max_walltime_s <= 0) {
+      stop("`max_walltime_s` must be a single positive finite number of seconds, or NULL for no cap.",
+           call. = FALSE)
+    }
+  }
+  if (!is.null(callback) && !is.function(callback)) {
+    stop("`callback` must be a function taking a single info list, or NULL.",
+         call. = FALSE)
+  }
+  if (!is.null(checkpoint_fun) && !is.function(checkpoint_fun)) {
+    stop("`checkpoint_fun` must be a function taking a single BATON_fit, or NULL.",
+         call. = FALSE)
+  }
+  # Integrality via %% 1 (not != as.integer()): as.integer() overflows to NA
+  # for values above .Machine$integer.max, which would make this check NA and
+  # crash the if(). Kept as numeric for the same reason; %% works exactly on
+  # integral doubles below 2^53 (carry-forward from the D6 review).
+  if (!is.numeric(checkpoint_every) || length(checkpoint_every) != 1 ||
+      !is.finite(checkpoint_every) || checkpoint_every < 1 ||
+      checkpoint_every %% 1 != 0) {
+    stop("`checkpoint_every` must be a single positive integer.", call. = FALSE)
+  }
+  checkpoint_every <- as.numeric(checkpoint_every)
+  # Task D8: slim = TRUE drops surrogates/diagnostics/multi_seed_runs from
+  # the returned fit (and skips the final surrogate refit).
+  if (!is.logical(slim) || length(slim) != 1L || is.na(slim)) {
+    stop("`slim` must be a single logical (TRUE or FALSE).", call. = FALSE)
+  }
+  walltime_exceeded <- function() {
+    !is.null(max_walltime_s) &&
+      as.numeric(difftime(Sys.time(), start_time, units = "secs")) > max_walltime_s
+  }
+  # D4 follow-up: with a walltime cap set, initial-design evaluation proceeds
+  # in chunks of the EFFECTIVE parallel worker count (effective_cores(): the
+  # BATON.cores option only when the platform can actually fork, else 1) so
+  # the cap is checked at chunk boundaries without losing parallel
+  # throughput, and serial platforms get a check per evaluation. With no cap
+  # the chunk spans the whole design (previous behavior, bit-identical
+  # results).
+  walltime_chunk <- if (is.null(max_walltime_s)) Inf else effective_cores()
 
   # Validate integer_params if provided
   if (!is.null(integer_params)) {
@@ -312,8 +530,8 @@ bo_calibrate <- function(sim_fun,
     enabled = TRUE,
     patience = 5,
     threshold = 1e-3,
-    consecutive = 2
-
+    consecutive = 2,
+    acq_rel = 1e-3   # acquisition-flatline stop: max EI < acq_rel * |incumbent|
   )
   if (!is.null(early_stop)) {
     if (is.list(early_stop)) {
@@ -322,12 +540,12 @@ bo_calibrate <- function(sim_fun,
       if (!is.null(early_stop$patience)) early_stop_config$patience <- early_stop$patience
       if (!is.null(early_stop$threshold)) early_stop_config$threshold <- early_stop$threshold
       if (!is.null(early_stop$consecutive)) early_stop_config$consecutive <- early_stop$consecutive
+      if (!is.null(early_stop$acq_rel)) early_stop_config$acq_rel <- early_stop$acq_rel
     } else {
       stop("`early_stop` must be a list or NULL.", call. = FALSE)
     }
   }
 
-  rng_seed <- if (is.null(seed)) sample.int(1e6, 1) else seed
   set.seed(rng_seed)
 
   fidelity_levels <- validate_fidelity_levels(fidelity_levels)
@@ -351,6 +569,48 @@ bo_calibrate <- function(sim_fun,
   }
 
   history <- initialise_history()
+
+  # Why the run ended (Task D2). "budget_exhausted" is the default when the
+  # BO while condition runs out; each break site overwrites it first. The
+  # walltime cap (D4) can also trip during the initialization phase below,
+  # which sets "walltime" here and skips the BO loop entirely.
+  run_status <- "budget_exhausted"
+  run_error <- NULL
+
+  # Task D7: on_error = "return_partial" turns an error inside an evaluation
+  # round or BO iteration into a graceful stop that keeps all completed work.
+  # run_guarded() wraps the risky regions; the wrapped expression is a promise
+  # evaluated in this frame, so its assignments (history, surrogates, ...)
+  # land here as usual. In the default "stop" mode NO handler is installed
+  # (the expression just runs), so errors propagate exactly as before: same
+  # condition, same message, raised from the same place. In "return_partial"
+  # mode a caught error records run_status/run_error and returns FALSE so the
+  # caller can break out of its loop. tryCatch(error =) does not catch
+  # interrupts; Ctrl-C still aborts either way. Granularity caveat: appends
+  # are per-round, so a failure inside evaluate_points() loses that round's
+  # rows (rows from PRIOR rounds always survive).
+  run_guarded <- if (on_error == "stop") {
+    function(expr) {
+      expr
+      TRUE
+    }
+  } else {
+    function(expr) {
+      tryCatch({
+        expr
+        TRUE
+      }, error = function(e) {
+        run_status <<- "errored"
+        run_error <<- conditionMessage(e)
+        if (progress) {
+          message(sprintf(
+            "Error caught (on_error = 'return_partial'): %s. Returning partial fit.",
+            run_error))
+        }
+        FALSE
+      })
+    }
+  }
 
   # Handle initial_history parameter (v0.4.0 warm-start feature)
   if (!is.null(initial_history)) {
@@ -497,23 +757,153 @@ bo_calibrate <- function(sim_fun,
 
     # Use filtered history
     history <- initial_history
-    n_init_actual <- nrow(initial_history)
+    n_donor <- nrow(initial_history)
 
-    # IMPORTANT: Update n_init to match warmstart history size
+    # Donor rows belong to the initial design (iter 0, eval_id 1..n_donor).
+    # Only stamp these when the columns are absent: a full previous-run
+    # history passed as initial_history keeps its own iter/eval_id.
+    if (!("iter" %in% names(history))) history$iter <- 0L
+    if (!("eval_id" %in% names(history))) history$eval_id <- seq_len(n_donor)
 
-    # This ensures early_stop_config works correctly (checks iter_counter > n_init)
-    # Without this, warmstart with 55 points but n_init=90 would require 91 BO iterations
-    # before early stopping is even considered
-    n_init <- n_init_actual
+    eval_counter <- n_donor
 
-    if (progress) {
+    # Task B2: donor seeds AUGMENT the LHS initial design instead of replacing
+    # it. When initial_history has fewer than n_init rows, top up with fresh
+    # LHS points so the BO loop never starts from a degenerate 1-3 point donor
+    # design. Deduplication covers donor theta_ids AND points accepted earlier
+    # in this top-up (integer_params coercion can collapse distinct LHS draws
+    # onto the same design); rejected draws are replenished with re-seeded LHS
+    # rounds until n_init is reached or the (small discrete) design space is
+    # exhausted.
+    n_init_requested <- min(n_init, budget)
+    if (n_donor < n_init_requested) {
+      n_needed <- n_init_requested - n_donor
+      seen_ids <- history$theta_id
+      accepted <- vector("list", n_needed)
+      n_accepted <- 0L
+
+      # theta_id collisions require every coordinate to coincide, which only
+      # happens in practice when ALL parameters are integer-coerced. In that
+      # case the design space is finite and its size tells us exactly when it
+      # is exhausted; with any continuous parameter collisions are
+      # measure-zero and the first round fills the design.
+      # Count integers whose rounding cell (k - 0.5, k + 0.5) overlaps the
+      # bounds -- coerce_theta_types uses round(), which reaches integers
+      # OUTSIDE non-integral bounds (round(0.4) = 0 for bounds [0.4, 3.6]).
+      # On exact half-endpoints this may overcount by an endpoint-only design;
+      # overcounting is safe (a few extra rounds under the attempt backstop),
+      # undercounting would truncate the design.
+      space_size <- if (length(bounds) > 0 &&
+                        all(names(bounds) %in% integer_params)) {
+        prod(vapply(bounds, function(b) {
+          max(0, floor(max(b) + 0.5) - ceiling(min(b) - 0.5) + 1)
+        }, numeric(1)))
+      } else {
+        Inf
+      }
+
+      attempt <- 0L
+      max_attempts <- 100L  # termination backstop only; exhaustion check below
+      while (n_accepted < n_needed &&
+             length(unique(seen_ids)) < space_size &&
+             attempt < max_attempts) {
+        # Round 1 draws exactly n_needed at rng_seed (continuous-path
+        # behavior unchanged); later rounds oversample so a few remaining
+        # slots do not need luck to land on unseen designs.
+        n_remaining <- n_needed - n_accepted
+        draw_size <- if (attempt == 0L) n_remaining else max(2L * n_remaining, 32L)
+        draw <- lhs_design(draw_size, bounds,
+                           seed = rng_seed + 1000L * attempt)
+        for (theta in draw) {
+          if (n_accepted >= n_needed) break
+          theta <- coerce_theta_types(theta, integer_params)
+          candidate_id <- theta_to_id(scale_to_unit(theta, bounds))
+          if (candidate_id %in% seen_ids) next
+          seen_ids <- c(seen_ids, candidate_id)
+          n_accepted <- n_accepted + 1L
+          accepted[[n_accepted]] <- theta
+        }
+        attempt <- attempt + 1L
+      }
+      # The top-up points are independent: evaluate them (in parallel when
+      # options(BATON.cores) opts in) in walltime-bounded chunks, appended in
+      # one bind per chunk (Tasks C2 + D4 follow-up). With no walltime cap
+      # this is a single chunk, identical to the previous behavior; per-point
+      # eval_ids and seeds are unchanged either way.
+      n_evaluated <- 0L
+      ok <- TRUE  # guard flag; initialized so the pattern survives reordering
+      while (n_evaluated < n_accepted) {
+        k <- as.integer(min(walltime_chunk, n_accepted - n_evaluated))
+        topup_specs <- lapply(seq_len(k), function(j) {
+          list(theta = accepted[[n_evaluated + j]], fidelity = primary_fidelity,
+               eval_id = eval_counter + j, iter = 0L,
+               seed = rng_seed + eval_counter + j)
+        })
+        # Task D7: guarded evaluation round. On error with
+        # on_error = "return_partial" this round's rows are lost (appends are
+        # per-round) but every previously appended row survives.
+        ok <- run_guarded({
+          topup_rows <- evaluate_points(
+            specs = topup_specs, sim_fun = sim_fun, bounds = bounds,
+            objective = objective, constraint_tbl = constraint_tbl,
+            fidelity_levels = fidelity_levels, ...
+          )
+          history <- append_rows(history, topup_rows)
+        })
+        if (!ok) break
+        if (progress) {
+          for (r in topup_rows) announce_evaluation(r, objective)
+        }
+        eval_counter <- eval_counter + k
+        n_evaluated <- n_evaluated + k
+        # D4 follow-up: walltime cap checked at top-up chunk boundaries.
+        if (walltime_exceeded() && n_evaluated < n_accepted) {
+          run_status <- "walltime"
+          if (progress) {
+            # n_evaluated counts only fresh top-up evaluations run here;
+            # eval_counter would also include donor rows not evaluated this run.
+            message(sprintf(
+              "Walltime cap (%.0fs) reached during initial-design top-up after %d evaluation(s).",
+              max_walltime_s, n_evaluated))
+          }
+          break
+        }
+      }
+      if (progress && run_status != "errored") {
+        # Attribute the shortfall correctly when both causes apply: the
+        # accept loop can exhaust the distinct-design space (n_accepted <
+        # n_needed) AND the walltime cap can stop evaluation of the accepted
+        # points (n_evaluated < n_accepted) in the same run. (An errored
+        # round already announced itself via run_guarded; skip this summary
+        # so the shortfall is not mislabeled as walltime/exhaustion.)
+        shortfall_exhausted <- n_needed - n_accepted
+        shortfall_walltime <- n_accepted - n_evaluated
+        message(sprintf(
+          "Initial design: %d donor row(s) augmented with %d fresh LHS point(s)%s",
+          n_donor, n_evaluated,
+          if (shortfall_exhausted > 0 && shortfall_walltime > 0) {
+            sprintf(" (%d fewer than requested: %d distinct designs exhausted, %d walltime cap)",
+                    n_needed - n_evaluated, shortfall_exhausted, shortfall_walltime)
+          } else if (shortfall_walltime > 0) {
+            sprintf(" (%d fewer than requested: walltime cap)",
+                    shortfall_walltime)
+          } else if (shortfall_exhausted > 0) {
+            sprintf(" (%d fewer than requested: distinct designs exhausted)",
+                    shortfall_exhausted)
+          } else ""
+        ))
+      }
+    } else if (progress) {
       message(sprintf(
         "Using %d evaluations from initial_history (skipping random initialization)",
-        n_init_actual
+        n_donor
       ))
     }
 
-    eval_counter <- n_init_actual
+    # IMPORTANT: n_init must reflect the actual initial design size (donors +
+    # fresh LHS). This keeps early_stop bookkeeping correct (it checks
+    # iter_counter relative to n_init).
+    n_init <- eval_counter
 
   } else {
     # Standard random initialization via Latin hypercube
@@ -535,24 +925,71 @@ bo_calibrate <- function(sim_fun,
                       init_stopping$min_init %||% 20))
     }
 
-    for (theta in initial_design) {
-      theta <- coerce_theta_types(theta, integer_params)
-      eval_counter <- eval_counter + 1L
-      history <- record_evaluation(
-        history = history,
-        sim_fun = sim_fun,
-        theta = theta,
-        bounds = bounds,
-        objective = objective,
-        constraint_tbl = constraint_tbl,
-        fidelity = primary_fidelity,
-        fidelity_levels = fidelity_levels,
-        eval_id = eval_counter,
-        iter = 0L,
-        seed = rng_seed + eval_counter,
-        progress = progress,
-        ...
-      )
+    # Task C2: initial-design points are independent, so they are evaluated in
+    # chunks (parallel when options(BATON.cores) opts in) and appended in one
+    # bind per chunk. GP-based init stopping only ever fires when eval_counter
+    # reaches a multiple of check_every (and >= min_init), so chunking up to
+    # the next such checkpoint preserves the sequential stopping decisions
+    # exactly; without init stopping the whole design is one chunk.
+    n_points <- length(initial_design)
+    point_pos <- 0L
+    ok <- TRUE  # guard flag; initialized so the pattern survives reordering
+    while (point_pos < n_points) {
+      if (use_init_stopping) {
+        ce <- init_stopping$check_every %||% 20
+        mi <- init_stopping$min_init %||% 20
+        next_check <- (floor(eval_counter / ce) + 1L) * ce
+        while (next_check < mi) next_check <- next_check + ce
+        chunk_n <- min(next_check - eval_counter, n_points - point_pos)
+      } else {
+        chunk_n <- n_points - point_pos
+      }
+      # D4 follow-up: bound chunks so the walltime cap below is checked often
+      # enough. Finer chunks preserve init-stopping checkpoints exactly (the
+      # checkpoint condition is a modulo on eval_counter).
+      chunk_n <- as.integer(min(chunk_n, walltime_chunk))
+      chunk_specs <- lapply(seq_len(chunk_n), function(j) {
+        theta <- coerce_theta_types(initial_design[[point_pos + j]], integer_params)
+        list(theta = theta, fidelity = primary_fidelity,
+             eval_id = eval_counter + j, iter = 0L,
+             seed = rng_seed + eval_counter + j)
+      })
+      # Task D7: guarded evaluation round. On error with
+      # on_error = "return_partial" this chunk's rows are lost (appends are
+      # per-round) but every previously appended chunk survives. Without a
+      # walltime cap the whole LHS design is one chunk, so an init failure
+      # yields an empty-history partial fit.
+      ok <- run_guarded({
+        chunk_rows <- evaluate_points(
+          specs = chunk_specs, sim_fun = sim_fun, bounds = bounds,
+          objective = objective, constraint_tbl = constraint_tbl,
+          fidelity_levels = fidelity_levels, ...
+        )
+        history <- append_rows(history, chunk_rows)
+      })
+      if (!ok) break
+      if (progress) {
+        for (r in chunk_rows) announce_evaluation(r, objective)
+      }
+      eval_counter <- eval_counter + chunk_n
+      point_pos <- point_pos + chunk_n
+
+      # D4 follow-up: walltime cap checked at init-chunk boundaries (never
+      # mid-chunk), so the partial init history is internally consistent.
+      # The point_pos guard mirrors the top-up path: a trip on the FINAL
+      # chunk is left to the BO loop's top-of-iteration check, so a run whose
+      # completed init design also fills the budget keeps its natural
+      # "budget_exhausted" status (Stage 4 is still suppressed via the
+      # walltime_exceeded() disjunct at the verification gate).
+      if (walltime_exceeded() && point_pos < n_points) {
+        run_status <- "walltime"
+        if (progress) {
+          message(sprintf(
+            "Walltime cap (%.0fs) reached during initialization after %d of %d evaluation(s).",
+            max_walltime_s, eval_counter, n_init))
+        }
+        break
+      }
 
       # Check GP-based initialization stopping
       if (use_init_stopping &&
@@ -615,8 +1052,68 @@ bo_calibrate <- function(sim_fun,
   best_obj_history <- numeric()
   no_improvement_count <- 0
   low_acq_count <- 0  # Counter for consecutive low acquisition score iterations
+  feasible_since_len <- NA_integer_  # length(best_obj_history) when feasibility first appeared
 
-  while (eval_counter < budget) {
+  # Stage 4 artifacts stay NULL/NA until post-loop verification runs; they are
+  # initialized here (rather than after the loop) so build_policies() below
+  # can read them at call time from inside the loop (Task D6 checkpoints).
+  multi_seed_summary <- NULL
+  multi_seed_runs <- NULL
+  verdict <- NA_character_
+
+  # Single constructor for the fit's policies list, shared by the periodic
+  # checkpoint hook (Task D6) and the final build_baton_fit call. A closure
+  # evaluated at call time (rather than a list built once here) because two
+  # entries are not loop-invariant: fidelity_levels is re-computed every
+  # iteration under the hybrid_staged method, and multi_seed_reps depends on
+  # the post-loop multi_seed_summary. Call-time evaluation keeps the final
+  # fit identical to the previous inline construction and keeps checkpoint
+  # policies truthful about the state at snapshot time. Note: hybrid_staged
+  # checkpoints pair dynamic fidelity_levels with base-derived fidelity_costs
+  # (pre-existing final-fit behavior, now visible mid-run; the resume recipe
+  # passes only initial_history, so the mismatch stays latent).
+  build_policies <- function() {
+    list(
+      acquisition = acquisition,
+      q = q,
+      budget = budget,
+      seed = rng_seed,
+      fidelity_levels = fidelity_levels,
+      fidelity_method = fidelity_method,
+      fidelity_costs = fidelity_costs,
+      candidate_pool = candidate_pool,
+      objective = objective,
+      early_stop = early_stop_config,
+      multi_seed_verify = multi_seed_verify,
+      multi_seed_n = if (multi_seed_verify) multi_seed_n else NA_integer_,
+      multi_seed_reps = if (multi_seed_verify && !is.null(multi_seed_summary)) {
+        multi_seed_summary$n_rep
+      } else {
+        NA_integer_
+      },
+      multi_seed_strict = multi_seed_strict,
+      # D8 review carry-forward: record slim so a persisted fit is unambiguous
+      # about WHY surrogates/diagnostics are NULL (slim vs a failed refit).
+      slim = slim
+    )
+  }
+
+  # run_status was initialized (Task D2) before the initialization phase; if
+  # the walltime cap already tripped there (or an initialization round
+  # errored under on_error = "return_partial", Task D7), skip the BO loop
+  # entirely.
+  ok <- TRUE  # guard flag; initialized so the pattern survives reordering
+  while (!(run_status %in% c("walltime", "errored")) && eval_counter < budget) {
+    # Task D4: advisory walltime cap, checked between iterations only (never
+    # mid-batch), so a partial fit is always internally consistent. Elapsed
+    # time can therefore overshoot the cap by up to one full iteration.
+    if (walltime_exceeded()) {
+      run_status <- "walltime"
+      if (progress) message(sprintf("Walltime cap (%.0fs) reached at iteration %d.",
+                                    max_walltime_s, iter_counter))
+      break
+    }
+
     iter_counter <- iter_counter + 1L
 
     # Compute dynamic fidelity levels for hybrid_staged method
@@ -640,12 +1137,31 @@ bo_calibrate <- function(sim_fun,
                       iter_counter, nrow(history)))
     }
 
+    # Task D7: the entire iteration work region (fit -> acquisition ->
+    # fidelity -> evaluate -> append) is guarded, not just the simulator
+    # calls: surrogate fitting can stop() mid-loop on ill-conditioned data
+    # after plenty of history exists. On error with
+    # on_error = "return_partial" the loop breaks with run_status "errored"
+    # and everything appended so far survives; a failure inside
+    # evaluate_points() loses only that batch (appends are per-round). The
+    # post-append sections (progress display, callback, checkpoint, early
+    # stopping) stay outside the guard: they contain the loop's break sites
+    # and are individually protected where they run user code.
+    # EDIT CONSTRAINT: do not add break/next/return anywhere inside this
+    # guarded block. The block is a promise evaluated in this function's
+    # frame, not a separate function: break/next would silently bypass the
+    # ok flag and every post-guard section of the iteration, and return()
+    # would exit bo_calibrate entirely. Loop-control decisions belong AFTER
+    # the closing "})" below.
+    ok <- run_guarded({
+
     # Fit surrogates with warm-start from previous iteration
     # Include tryCatch to handle fitting failures gracefully
     surrogates <- tryCatch({
       fit_surrogates(history, objective, constraint_tbl,
                      covtype = covtype,
-                     prev_surrogates = prev_surrogates)
+                     prev_surrogates = prev_surrogates,
+                     fit_seed = rng_seed + 10000L * iter_counter)
     }, error = function(e) {
       warning(sprintf("Surrogate fitting failed at iteration %d: %s. Retrying without warm-start.",
                       iter_counter, e$message))
@@ -653,7 +1169,8 @@ bo_calibrate <- function(sim_fun,
       tryCatch({
         fit_surrogates(history, objective, constraint_tbl,
                        covtype = covtype,
-                       prev_surrogates = NULL)
+                       prev_surrogates = NULL,
+                       fit_seed = rng_seed + 10000L * iter_counter)
       }, error = function(e2) {
         stop(sprintf("Surrogate fitting failed even without warm-start: %s", e2$message),
              call. = FALSE)
@@ -713,8 +1230,10 @@ bo_calibrate <- function(sim_fun,
     } else {
       # Batch: use local penalization for spatial diversity
       lipschitz <- estimate_lipschitz(surrogates, objective)
-      # Increase Lipschitz by 50% for stronger diversity
-      lipschitz <- lipschitz * 1.5
+      # NOTE: with the corrected penalty (penalty = acq_best - L*r), a LARGER L
+      # shrinks the suppression radius (acq_best/L) and thus REDUCES diversity.
+      # The previous 1.5x inflation was calibrated to the old, inverted penalty
+      # and is dropped: scaling L here would now weaken diversity, not strengthen it.
       selected_idx <- select_batch_local_penalization(
         candidates = unit_candidates,
         acq_scores = acquisition_scores,
@@ -723,16 +1242,32 @@ bo_calibrate <- function(sim_fun,
       )
     }
 
-    selected_candidates <- unit_candidates[selected_idx]
+    selected_candidates <- unit_candidates[selected_idx, , drop = FALSE]
 
     if (progress && length(selected_idx) > 0) {
       max_acq <- max(acquisition_scores[selected_idx])
       message(sprintf("  -> max acquisition score: %.3f", max_acq))
     }
 
+    # Task C2, pass 1 (sequential, no simulator calls): decide fidelity and
+    # bookkeeping for every batch point. The only cross-point dependency in
+    # the old per-point loop was total_budget_used, which included the ACTUAL
+    # n_rep of earlier in-batch evaluations; it is now accumulated from the
+    # REQUESTED n_rep (fidelity_levels[[fidelity]]) of earlier picks. The two
+    # agree unless the simulator overrides its n_rep attribute, in which case
+    # later in-batch fidelity decisions see the requested value -- batch
+    # points are conceptually simultaneous, and this is what makes them
+    # independently evaluable.
+    batch_budget_base <- if ("n_rep" %in% names(history)) sum(history$n_rep, na.rm = TRUE) else 0L
+    predicted_batch_reps <- 0
+    batch_specs <- vector("list", n_new)
+    # Hoisted once per iteration (Task C7): the best feasible design for the
+    # hybrid_staged proximity bonus. History is fixed during pass 1, so the
+    # lookup does not belong in the per-point loop.
+    best_unit <- best_feasible_unit(history, "objective", bounds)
     for (i in seq_len(n_new)) {
       eval_counter <- eval_counter + 1L
-      chosen_unit <- selected_candidates[[i]]
+      chosen_unit <- selected_candidates[i, ]
       theta <- scale_from_unit(chosen_unit, bounds)
       theta <- coerce_theta_types(theta, integer_params)
 
@@ -779,20 +1314,16 @@ bo_calibrate <- function(sim_fun,
       # Get acquisition value for this candidate
       acq_val <- acquisition_scores[selected_idx[i]]
 
-      # Compute total budget used so far
-      total_budget_used <- if ("n_rep" %in% names(history)) sum(history$n_rep, na.rm = TRUE) else 0L
+      # Compute total budget used so far (history + earlier in-batch picks)
+      total_budget_used <- batch_budget_base + predicted_batch_reps
       total_budget_sim <- budget * mean(fidelity_levels)  # approximate
 
-      # Compute distance to current best for hybrid_staged proximity bonus
-      distance_to_best <- 1.0  # default: far from best
-      if (!is.na(best_feasible_value)) {
-        # Find best feasible design
-        best_idx <- which(history$feasible & history[[objective]] == best_feasible_value)
-        if (length(best_idx) > 0) {
-          best_theta <- history$theta[[best_idx[1]]]
-          # Euclidean distance in scaled [0,1] space
-          distance_to_best <- sqrt(sum((chosen_unit - unlist(scale_to_unit(best_theta, bounds)))^2))
-        }
+      # Distance to the current best feasible design (hybrid_staged proximity
+      # bonus), in scaled [0,1] space; 1.0 = far from best / none feasible.
+      distance_to_best <- if (is.null(best_unit)) {
+        1.0
+      } else {
+        sqrt(sum((chosen_unit - best_unit)^2))
       }
 
       # Select fidelity using configured method
@@ -824,55 +1355,156 @@ bo_calibrate <- function(sim_fun,
                         iter_counter, prob_feas, cv_estimate, effective_metric, fidelity))
       }
 
-      history <- record_evaluation(
-        history = history,
-        sim_fun = sim_fun,
+      predicted_batch_reps <- predicted_batch_reps + fidelity_levels[[fidelity]]
+      batch_specs[[i]] <- list(
         theta = theta,
-        bounds = bounds,
-        objective = objective,
-        constraint_tbl = constraint_tbl,
         fidelity = fidelity,
-        fidelity_levels = fidelity_levels,
         eval_id = eval_counter,
         iter = iter_counter,
         seed = rng_seed + eval_counter,
-        progress = progress,
         extra = list(prob_feas = prob_feas,
                      cv_estimate = cv_estimate,
-                     acq_score = acq_val),
-        ...
+                     acq_score = acq_val)
       )
+    }
 
-      # Update cumulative budget for dynamic fidelity tracking
-      cumulative_budget_used <- if ("n_rep" %in% names(history)) sum(history$n_rep, na.rm = TRUE) else 0L
+    # Task C2, pass 2: evaluate the batch (in parallel when
+    # options(BATON.cores) opts in) and append all rows in one bind.
+    batch_rows <- evaluate_points(
+      specs = batch_specs, sim_fun = sim_fun, bounds = bounds,
+      objective = objective, constraint_tbl = constraint_tbl,
+      fidelity_levels = fidelity_levels, ...
+    )
+    history <- append_rows(history, batch_rows)
 
-      # Progress display: use observed (BOI) best for informative tracking
-      # BPM incumbent changes only when surrogates are re-fit (once per iteration),
-      # so it shows 0.000 within batches. Observed best changes with each new feasible eval.
-      current_best_display <- best_feasible_objective(history, objective,
-                                                       surrogates = NULL,
-                                                       high_fidelity_only = FALSE,
-                                                       incumbent_method = "boi")
-      if (progress && is.finite(current_best_display) && is.finite(last_best_objective_display)) {
-        message(sprintf("  -> best observed feasible: %.3f (change: %.3f)",
-                        current_best_display, current_best_display - last_best_objective_display))
-      }
-      if (is.finite(current_best_display)) {
-        last_best_objective_display <- current_best_display
-      }
+    # Update cumulative budget for dynamic fidelity tracking
+    cumulative_budget_used <- if ("n_rep" %in% names(history)) sum(history$n_rep, na.rm = TRUE) else 0L
+
+    })  # end run_guarded (Task D7); no break/next/return inside the block
+        # above (see the EDIT CONSTRAINT note at its opening).
+    if (!ok) break
+
+    # Progress display: use observed (BOI) best for informative tracking.
+    # BPM incumbent changes only when surrogates are re-fit (once per
+    # iteration), so it shows 0.000 within batches; the observed best is
+    # reported once per batch now that evaluations complete together.
+    if (progress) {
+      for (r in batch_rows) announce_evaluation(r, objective)
+    }
+    current_best_display <- best_feasible_objective(history, objective,
+                                                     surrogates = NULL,
+                                                     high_fidelity_only = FALSE,
+                                                     incumbent_method = "boi")
+    if (progress && is.finite(current_best_display) && is.finite(last_best_objective_display)) {
+      message(sprintf("  -> best observed feasible: %.3f (change: %.3f)",
+                      current_best_display, current_best_display - last_best_objective_display))
+    }
+    if (is.finite(current_best_display)) {
+      last_best_objective_display <- current_best_display
     }
 
     # Update for warm-starting next iteration
     prev_surrogates <- surrogates
 
+    # Task D5: per-iteration callback with cooperative cancellation. Invoked
+    # at the end of each BO iteration, after the batch has been recorded, so
+    # cancellation never interrupts a batch mid-flight and no completed work
+    # is discarded. Contract: return TRUE to continue; anything else cancels.
+    # A callback error warns and continues (a monitoring hook must not kill a
+    # paid run). If cancellation and the walltime cap collide in the same
+    # iteration, "cancelled" wins: this break exits the loop before the
+    # top-of-loop walltime check can run.
+    if (!is.null(callback)) {
+      keep_going <- tryCatch(
+        isTRUE(callback(list(
+          iter = iter_counter,
+          eval_count = eval_counter,
+          best_objective = if (is.finite(best_feasible_value)) best_feasible_value else NA_real_,
+          best_observed = if (is.finite(current_best_display)) current_best_display else NA_real_,
+          elapsed_s = as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+        ))),
+        error = function(e) {
+          warning(sprintf("callback error (continuing): %s", conditionMessage(e)),
+                  call. = FALSE)
+          TRUE
+        })
+      if (!keep_going) {
+        run_status <- "cancelled"
+        if (progress) {
+          message(sprintf("Cancelled by callback at iteration %d.", iter_counter))
+        }
+        break
+      }
+    }
+
+    # Task D6: periodic resumable snapshot every checkpoint_every completed BO
+    # iterations (iteration-granular, not per-evaluation; the initial design
+    # phase emits none). Checkpoints are slim by construction: surrogates and
+    # diagnostics are NULL because GP objects are large, environment-laden,
+    # and not needed to resume (a resume refits from history via
+    # initial_history). Incumbent info is the observed feasible best by row;
+    # no surrogate fit is performed here. An error in checkpoint_fun warns
+    # and continues, same rationale as the callback above.
+    # ORDERING NOTE (deliberate, do not "fix"): this hook runs BEFORE the
+    # early-stopping bookkeeping below, so the early-stop counters have not
+    # yet absorbed the current iteration at snapshot time. That is fine: the
+    # counters are in-loop state, not part of the history, and a resume via
+    # initial_history resets them regardless.
+    if (!is.null(checkpoint_fun) && iter_counter %% checkpoint_every == 0L) {
+      # which.min() returns integer(0) when every feasible row has an NA
+      # objective (and ckpt_feas_idx[integer(0)] is integer(0) when none is
+      # feasible), so gate on length rather than is.na(): is.na(integer(0))
+      # is logical(0) and would crash the if() (D6 review carry-forward).
+      ckpt_feas_idx <- which(history$feasible)
+      ckpt_best_candidate <- ckpt_feas_idx[which.min(history$objective[ckpt_feas_idx])]
+      ckpt_best_row <- if (length(ckpt_best_candidate) == 1L) {
+        ckpt_best_candidate
+      } else {
+        NA_integer_
+      }
+      # Build the snapshot BEFORE the tryCatch so the "checkpoint_fun error"
+      # warning is only ever attributed to the USER's function; a bug in
+      # build_baton_fit/build_policies must surface as a real error, not be
+      # silently swallowed as a checkpoint hiccup (D6 review carry-forward).
+      ckpt_fit <- build_baton_fit(
+        history = history,
+        best_theta = if (is.na(ckpt_best_row)) NULL else history$theta[[ckpt_best_row]],
+        best_objective = if (is.na(ckpt_best_row)) NA_real_ else history$objective[[ckpt_best_row]],
+        surrogates = NULL,
+        policies = build_policies(),
+        diagnostics = NULL,
+        multi_seed_summary = NULL,
+        multi_seed_runs = NULL,
+        verdict = NA_character_,
+        bounds = bounds,
+        constraints = constraints,
+        constraint_tbl = constraint_tbl,
+        status = "checkpoint"
+      )
+      tryCatch(checkpoint_fun(ckpt_fit), error = function(e) {
+        warning(sprintf("checkpoint_fun error (continuing): %s",
+                        conditionMessage(e)), call. = FALSE)
+      })
+    }
+
     # Early stopping check
-    current_best <- if (is.finite(best_feasible_value)) {
+    has_feasible <- is.finite(best_feasible_value)
+    current_best <- if (has_feasible) {
       best_feasible_value
     } else {
       # No feasible solution yet, use best infeasible
       min(history$objective, na.rm = TRUE)
     }
     best_obj_history <- c(best_obj_history, current_best)
+    # Record when feasibility first appeared. The infeasible-phase objectives
+    # (best infeasible minimum) and the feasible-phase incumbent are different
+    # quantities, and the transition typically shows as a large negative
+    # "improvement"; comparing across it can trigger early stopping right when
+    # the search finally becomes feasible. So the improvement-based stop only
+    # compares WITHIN the feasible phase.
+    if (has_feasible && is.na(feasible_since_len)) {
+      feasible_since_len <- length(best_obj_history)
+    }
 
     # Check for early stopping after minimum iterations (if enabled)
     # Start checking after 3 BO iterations (not n_init, which could be 60+)
@@ -882,7 +1514,11 @@ bo_calibrate <- function(sim_fun,
       es_patience <- early_stop_config$patience  # default: 5 iterations
       es_threshold <- early_stop_config$threshold  # default: 1e-3 (0.1%)
 
-      if (length(best_obj_history) >= es_patience + 1) {
+      # Number of feasible-phase entries available for comparison.
+      feasible_phase_len <- if (is.na(feasible_since_len)) 0L else
+        length(best_obj_history) - feasible_since_len + 1L
+
+      if (has_feasible && feasible_phase_len >= es_patience + 1) {
         # Compare current best vs best from es_patience iterations ago
         current_best_val <- best_obj_history[length(best_obj_history)]
         earlier_best_val <- best_obj_history[length(best_obj_history) - es_patience]
@@ -903,6 +1539,7 @@ bo_calibrate <- function(sim_fun,
               message(sprintf("Early stopping at iteration %d: no improvement > %.1f%% for %d consecutive iterations",
                               iter_counter, es_threshold * 100, no_improvement_count))
             }
+            run_status <- "early_stopped"
             break
           }
         } else {
@@ -924,13 +1561,21 @@ bo_calibrate <- function(sim_fun,
         selected_acq_max <- Inf  # Don't trigger early stopping if no candidates selected
       }
       acq_patience <- 3  # Number of consecutive low-acq iterations required
-      if (is.finite(selected_acq_max) && selected_acq_max < 0.1) {
+      # Relative threshold: EI (objective units) is scaled by the incumbent, so
+      # the criterion means the same thing whether the objective is O(1) (a
+      # probability) or O(100) (expected enrollment). The old absolute 0.1
+      # stopped [0,1]-scale objectives almost immediately and never fired for
+      # large-scale ones.
+      acq_stop_level <- early_stop_config$acq_rel *
+        (if (has_feasible) max(abs(best_feasible_value), 1e-8) else 1)
+      if (is.finite(selected_acq_max) && selected_acq_max < acq_stop_level) {
         low_acq_count <- low_acq_count + 1
         if (low_acq_count >= acq_patience) {
           if (progress) {
-            message(sprintf("Early stopping at iteration %d: max acquisition < 0.1 for %d consecutive iterations",
-                            iter_counter, acq_patience))
+            message(sprintf("Early stopping at iteration %d: max acquisition < %.3g for %d consecutive iterations",
+                            iter_counter, acq_stop_level, acq_patience))
           }
+          run_status <- "acq_flatline"
           break
         }
       } else {
@@ -939,30 +1584,119 @@ bo_calibrate <- function(sim_fun,
     }
   }
 
-  final_surrogates <- fit_surrogates(history, objective, constraint_tbl,
-                                      covtype = covtype,
-                                      prev_surrogates = prev_surrogates)
-  best_idx <- best_feasible_index(history, objective)
-  best_theta <- history$theta[[best_idx]]
-
-  diagnostics <- generate_diagnostics(final_surrogates, history, objective)
-
-  # Compute best objective value from feasible solutions
-  feasible_history <- history[history$feasible, , drop = FALSE]
-  best_objective <- if (nrow(feasible_history) > 0) {
-    min(feasible_history$objective, na.rm = TRUE)
+  # Task D7: under on_error = "return_partial" the final refit is attempted
+  # inside its own tryCatch. The partial history may be exactly the kind of
+  # ill-conditioned data that errored the in-loop fit, and losing the whole
+  # fit here would defeat the point; surrogates are NULL in that case. When
+  # the failure is the FIRST error of the run (a completed loop whose final
+  # refit fails), it sets run_status/run_error; an already-errored run keeps
+  # its ORIGINAL in-loop error message. In "stop" mode nothing changes: the
+  # refit runs unguarded and any error propagates as before.
+  # Task D8: slim = TRUE skips the final refit entirely. Nothing downstream
+  # consumes it except the returned surrogates slot and generate_diagnostics
+  # (both dropped under slim): best_theta comes from best_feasible_index()
+  # and best_objective from the feasible history rows, and Stage 4 uses only
+  # best_theta. Consequence: an error arising only in the final refit cannot
+  # surface under slim (the run keeps its natural status in either on_error
+  # mode); documented in the roxygen for slim.
+  # EDIT CONSTRAINT: any new consumer of final_surrogates below this point
+  # must handle NULL. Both slim = TRUE and the return_partial failed-refit
+  # path above produce final_surrogates = NULL on an otherwise valid fit.
+  final_surrogates <- if (slim) {
+    NULL
+  } else if (on_error == "return_partial") {
+    tryCatch(
+      fit_surrogates(history, objective, constraint_tbl,
+                     covtype = covtype,
+                     prev_surrogates = prev_surrogates,
+                     fit_seed = rng_seed + 99999L),
+      error = function(e) {
+        if (run_status != "errored") {
+          run_status <<- "errored"
+          run_error <<- conditionMessage(e)
+        }
+        NULL
+      })
   } else {
-    NA_real_
+    fit_surrogates(history, objective, constraint_tbl,
+                   covtype = covtype,
+                   prev_surrogates = prev_surrogates,
+                   fit_seed = rng_seed + 99999L)
+  }
+
+  # Empty history is only reachable under on_error = "return_partial" (an
+  # errored first evaluation round); indexing best_feasible_index() there
+  # would fail. In "stop" mode at least one evaluation always exists (any
+  # earlier error propagated), so this branch never fires and the path below
+  # is byte-identical to the previous behavior.
+  if (nrow(history) == 0L) {
+    best_theta <- NULL
+    best_objective <- NA_real_
+    diagnostics <- NULL
+  } else {
+    best_idx <- best_feasible_index(history, objective)
+    best_theta <- history$theta[[best_idx]]
+
+    # D7 review carry-forward: under return_partial a diagnostics failure
+    # after a SUCCESSFUL refit must not lose the fit; diagnostics are a
+    # reporting artifact, so they are dropped with a warning and the run
+    # keeps its natural status (no run_status/run_error change). In "stop"
+    # mode the error propagates as before. Under slim = TRUE this whole
+    # branch is moot: final_surrogates is NULL (refit skipped), so
+    # diagnostics are NULL without ever calling generate_diagnostics.
+    diagnostics <- if (is.null(final_surrogates)) {
+      NULL
+    } else if (on_error == "return_partial") {
+      tryCatch(
+        generate_diagnostics(final_surrogates, history, objective),
+        error = function(e) {
+          warning(sprintf(
+            "diagnostics generation failed (diagnostics dropped from the fit): %s",
+            conditionMessage(e)), call. = FALSE)
+          NULL
+        })
+    } else {
+      generate_diagnostics(final_surrogates, history, objective)
+    }
+
+    # Compute best objective value from feasible solutions
+    feasible_history <- history[history$feasible, , drop = FALSE]
+    best_objective <- if (nrow(feasible_history) > 0) {
+      min(feasible_history$objective, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
   }
 
   # v0.4.0 Stage 4: multi-seed verification gate. Re-evaluates the calibrated
   # design at multiple independent seeds at high fidelity to detect
   # stored-vs-actual operating-characteristic gaps. Backward-compatible default
-  # (multi_seed_verify = FALSE).
-  multi_seed_summary <- NULL
-  multi_seed_runs <- NULL
-  verdict <- NA_character_
-  if (multi_seed_verify && !is.na(best_objective)) {
+  # (multi_seed_verify = FALSE). multi_seed_summary / multi_seed_runs /
+  # verdict were initialized (NULL/NULL/NA) before the BO loop.
+  if (multi_seed_verify &&
+      (run_status %in% c("walltime", "cancelled", "errored") || walltime_exceeded())) {
+    # D4 follow-up: never launch Stage 4 (multi_seed_n high-fidelity
+    # re-evaluations) once the walltime cap has been reached; that work could
+    # dwarf the cap itself. The walltime_exceeded() disjunct covers runs that
+    # end via the loop CONDITION going false (e.g. a budget-filling final
+    # chunk or batch that crosses the cap): status still records why the run
+    # ended ("budget_exhausted" etc.), but verification is suppressed. Task
+    # D5 adds the "cancelled" case: a caller who cancelled via the callback
+    # asked the run to stop, so launching a fresh block of high-fidelity
+    # verification work would defeat the point of cancelling. Task D7 adds
+    # the "errored" case: a run that already hit an infrastructure or
+    # numerical failure should return its partial fit immediately, not
+    # launch fresh verification work against the same failing backend. The
+    # fit is returned with multi_seed_summary / multi_seed_runs NULL and
+    # verdict NA, same as multi_seed_verify = FALSE.
+    if (progress) {
+      message(sprintf(
+        "Stage 4 multi-seed verification skipped: %s.",
+        if (run_status == "cancelled") "run cancelled by callback"
+        else if (run_status == "errored") "run errored (partial fit returned)"
+        else "walltime cap tripped or exceeded"))
+    }
+  } else if (multi_seed_verify && !is.na(best_objective)) {
     if (is.null(multi_seed_reps)) {
       ms_reps <- as.integer(fidelity_levels[["high"]])
     } else {
@@ -975,73 +1709,117 @@ bo_calibrate <- function(sim_fun,
         multi_seed_n, ms_reps, ms_seeds[1], ms_seeds[length(ms_seeds)]
       ))
     }
-    ms_result <- run_multi_seed_verification(
-      sim_fun = sim_fun,
-      theta = best_theta,
-      seeds = ms_seeds,
-      n_rep = ms_reps,
-      objective = objective,
-      constraint_tbl = constraint_tbl,
-      progress = progress,
-      ...
-    )
-    multi_seed_runs <- ms_result$per_seed
-    multi_seed_summary <- ms_result$summary
-    verdict <- if (multi_seed_summary$strict_feas == 1) {
-      "MULTI_SEED_PASS"
-    } else if (multi_seed_strict) {
-      "MULTI_SEED_FAIL"
-    } else {
-      "MULTI_SEED_WARN"
-    }
-    if (progress) {
-      message(sprintf(
-        "Stage 4 verdict: %s (strict feas %d/%d; %s mean = %.4f, sd = %.4f)",
-        verdict,
-        multi_seed_summary$strict_feas_count,
-        multi_seed_n,
-        objective,
-        multi_seed_summary$objective_mean,
-        multi_seed_summary$objective_sd
-      ))
+    # D7 review carry-forward: the Stage 4 block runs AFTER the most
+    # expensive simulator work of the run, so under return_partial a crash
+    # here (one that escapes run_multi_seed_verification's per-seed
+    # tryCatch, e.g. a malformed simulator return breaking the summary
+    # construction) must not lose the fit. run_guarded() applies the same
+    # pattern as the in-loop guards: in "stop" mode it is a no-op wrapper
+    # (errors propagate unchanged); in "return_partial" mode a caught error
+    # sets run_status "errored" + run_error and we reset the verification
+    # fields so the fit carries no half-built gate artifacts.
+    ms_ok <- run_guarded({
+      ms_result <- run_multi_seed_verification(
+        sim_fun = sim_fun,
+        theta = best_theta,
+        seeds = ms_seeds,
+        n_rep = ms_reps,
+        objective = objective,
+        constraint_tbl = constraint_tbl,
+        progress = progress,
+        ...
+      )
+      multi_seed_runs <- ms_result$per_seed
+      multi_seed_summary <- ms_result$summary
+      verdict <- if (multi_seed_summary$strict_feas == 1) {
+        "MULTI_SEED_PASS"
+      } else if (multi_seed_strict) {
+        "MULTI_SEED_FAIL"
+      } else {
+        "MULTI_SEED_WARN"
+      }
+      if (progress) {
+        message(sprintf(
+          "Stage 4 verdict: %s (strict feas %d/%d; %s mean = %.4f, sd = %.4f)",
+          verdict,
+          multi_seed_summary$strict_feas_count,
+          multi_seed_n,
+          objective,
+          multi_seed_summary$objective_mean,
+          multi_seed_summary$objective_sd
+        ))
+      }
+    })
+    if (!ms_ok) {
+      multi_seed_runs <- NULL
+      multi_seed_summary <- NULL
+      verdict <- NA_character_
     }
   }
 
+  build_baton_fit(
+    history = history,
+    best_theta = best_theta,
+    best_objective = best_objective,
+    surrogates = final_surrogates,
+    policies = build_policies(),
+    diagnostics = diagnostics,
+    multi_seed_summary = multi_seed_summary,
+    # Task D8: slim keeps the adoption gate (multi_seed_summary + verdict)
+    # but drops the per-seed evaluation table; surrogates and diagnostics
+    # are already NULL under slim (final refit skipped above).
+    multi_seed_runs = if (slim) NULL else multi_seed_runs,
+    verdict = verdict,
+    bounds = bounds,
+    constraints = constraints,
+    constraint_tbl = constraint_tbl,
+    status = run_status,
+    error_message = run_error
+  )
+}
+
+#' Assemble a BATON_fit object (Task D1)
+#'
+#' Single construction point so normal completion, partial returns
+#' (error/cancel/walltime), and checkpoints produce structurally identical
+#' objects. `status` records why the run ended.
+#'
+#' Notes on fields: `multi_seed_summary`/`multi_seed_runs` are the v0.4.0
+#' multi-seed verification artifacts (NULL if multi_seed_verify = FALSE);
+#' `bounds`/`constraints` are stored to support warm-starting.
+#' @keywords internal
+build_baton_fit <- function(history, best_theta, best_objective, surrogates,
+                            policies, diagnostics, multi_seed_summary,
+                            multi_seed_runs, verdict, bounds, constraints,
+                            constraint_tbl, status, error_message = NULL) {
+  # Exact matching (not match.arg) so partial matches like "budget" are
+  # rejected. errored is constructed by the D7 on_error = "return_partial"
+  # path in bo_calibrate and by the philosophies wrapper's isolation layer;
+  # completed is legacy, slated for removal once nothing constructs it.
+  status_values <- c("budget_exhausted", "early_stopped", "acq_flatline",
+                     "cancelled", "walltime", "errored", "checkpoint",
+                     "completed")
+  if (!is.character(status) || length(status) != 1L || !status %in% status_values) {
+    stop(sprintf("Invalid status '%s'. Must be one of: %s",
+                 paste(status, collapse = ", "),
+                 paste(status_values, collapse = ", ")), call. = FALSE)
+  }
   structure(
     list(
       history = history,
       best_theta = best_theta,
       best_objective = best_objective,
-      surrogates = final_surrogates,
-      policies = list(
-        acquisition = acquisition,
-        q = q,
-        budget = budget,
-        seed = rng_seed,
-        fidelity_levels = fidelity_levels,
-        fidelity_method = fidelity_method,
-        fidelity_costs = fidelity_costs,
-        candidate_pool = candidate_pool,
-        objective = objective,
-        early_stop = early_stop_config,
-        multi_seed_verify = multi_seed_verify,
-        multi_seed_n = if (multi_seed_verify) multi_seed_n else NA_integer_,
-        multi_seed_reps = if (multi_seed_verify && !is.null(multi_seed_summary)) {
-          multi_seed_summary$n_rep
-        } else {
-          NA_integer_
-        },
-        multi_seed_strict = multi_seed_strict
-      ),
+      surrogates = surrogates,
+      policies = policies,
       diagnostics = diagnostics,
-      # v0.4.0: multi-seed verification artifacts (NULL if multi_seed_verify=FALSE)
       multi_seed_summary = multi_seed_summary,
       multi_seed_runs = multi_seed_runs,
       verdict = verdict,
-      # NEW: Store bounds and constraints for warm-starting
       bounds = bounds,
       constraints = constraints,
-      constraint_tbl = constraint_tbl
+      constraint_tbl = constraint_tbl,
+      status = status,
+      error_message = error_message
     ),
     class = c("BATON_fit", "list")
   )
@@ -1067,9 +1845,17 @@ initialise_history <- function() {
   )
 }
 
+#' Evaluate one design and build its history row (pure, no side effects)
+#'
+#' Task C2: the evaluation itself is separated from history mutation so that
+#' independent points (initial design, BO batches) can be evaluated
+#' concurrently and appended in one bind. The simulator call runs under
+#' `run_seeded(seed)` so its RNG use neither depends on stream position nor
+#' leaks into the optimizer's stream -- this is what makes results identical
+#' whether points are evaluated serially or in parallel forks.
+#'
 #' @keywords internal
-record_evaluation <- function(history,
-                              sim_fun,
+invoke_evaluation <- function(sim_fun,
                               theta,
                               bounds,
                               objective,
@@ -1079,19 +1865,20 @@ record_evaluation <- function(history,
                               eval_id,
                               iter,
                               seed,
-                              progress,
                               extra = NULL,
                               ...) {
   unit_theta <- scale_to_unit(theta, bounds)
   theta_id <- theta_to_id(unit_theta)
-  result <- invoke_simulator(
-    sim_fun = sim_fun,
-    theta = theta,
-    fidelity = fidelity,
-    n_rep = fidelity_levels[[fidelity]],
-    seed = seed,
-    ...
-  )
+  result <- run_seeded(seed, function() {
+    invoke_simulator(
+      sim_fun = sim_fun,
+      theta = theta,
+      fidelity = fidelity,
+      n_rep = fidelity_levels[[fidelity]],
+      seed = seed,
+      ...
+    )
+  })
 
   metrics <- result$metrics
   variance <- result$variance
@@ -1099,10 +1886,19 @@ record_evaluation <- function(history,
 
   feasible <- is_feasible(metrics, constraint_tbl)
 
-  objective_value <- metrics[[objective]]
-  if (is.null(objective_value)) {
-    stop(sprintf("Objective '%s' not returned by simulator.", objective), call. = FALSE)
+  # Check membership before subsetting: metrics has been normalized to a named
+  # numeric vector by invoke_simulator(), and `metrics[[objective]]` on a
+  # numeric vector with a missing name throws a bare "subscript out of bounds"
+  # before any is.null() guard can fire. Mirrors the constraint-name check below.
+  if (!objective %in% names(metrics)) {
+    stop(sprintf(
+      paste0("Objective '%s' not returned by simulator. ",
+             "Simulator returned: %s. The objective must be one of the ",
+             "named metrics the simulator returns."),
+      objective, paste(names(metrics), collapse = ", ")
+    ), call. = FALSE)
   }
+  objective_value <- metrics[[objective]]
 
   # Validate that every constraint metric name is actually returned by the
   # simulator. Without this check, a misnamed constraint metric (e.g. "pwr"
@@ -1122,13 +1918,6 @@ record_evaluation <- function(history,
         paste(names(metrics), collapse = ", ")
       ), call. = FALSE)
     }
-  }
-
-  if (progress) {
-    msg <- sprintf("  Eval %03d (iter %02d, %s fidelity): %s = %.4f%s",
-                   eval_id, iter, fidelity, objective, objective_value,
-                   if (feasible) " [feasible]" else "")
-    message(msg)
   }
 
   if (is.null(extra)) extra <- list()
@@ -1205,29 +1994,137 @@ record_evaluation <- function(history,
     new_row <- base_row
   }
 
+  new_row
+}
+
+#' Append evaluation rows to the history in a single bind
+#' @keywords internal
+append_rows <- function(history, rows) {
+  rows <- rows[!vapply(rows, is.null, logical(1))]
+  if (length(rows) == 0) return(history)
+  new_rows <- dplyr::bind_rows(rows)
   # Ensure type consistency before binding
   tryCatch({
-    dplyr::bind_rows(history, new_row)
+    dplyr::bind_rows(history, new_rows)
   }, error = function(e) {
     # If bind_rows fails, try to diagnose and fix
-    warning(sprintf("bind_rows failed at eval_id %d: %s. Attempting type coercion.",
-                    eval_id, e$message))
-    # Coerce all columns in history to match new_row types
-    for (col in names(new_row)) {
-      if (col %in% names(history) && !inherits(new_row[[col]], "list")) {
+    warning(sprintf("bind_rows failed at eval_id %s: %s. Attempting type coercion.",
+                    paste(new_rows$eval_id, collapse = ","), e$message))
+    # Coerce all columns in history to match new_rows types
+    for (col in names(new_rows)) {
+      if (col %in% names(history) && !inherits(new_rows[[col]], "list")) {
         history[[col]] <- tryCatch(
-          as(history[[col]], class(new_row[[col]])[1]),
+          as(history[[col]], class(new_rows[[col]])[1]),
           error = function(e2) history[[col]]
         )
       }
     }
-    dplyr::bind_rows(history, new_row)
+    dplyr::bind_rows(history, new_rows)
   })
+}
+
+#' Print the per-evaluation progress line from a completed history row
+#' @keywords internal
+announce_evaluation <- function(row, objective) {
+  message(sprintf("  Eval %03d (iter %02d, %s fidelity): %s = %.4f%s",
+                  row$eval_id, row$iter, row$fidelity, objective, row$objective,
+                  if (isTRUE(row$feasible)) " [feasible]" else ""))
+}
+
+#' Evaluate a set of independent design points, optionally in parallel
+#'
+#' Each spec is a list with `theta`, `fidelity`, `eval_id`, `iter`, `seed`,
+#' and optionally `extra`. Points run concurrently when the user opts in via
+#' `options(BATON.cores = k)` on Unix (same convention as `fit_surrogates`);
+#' per-point seeding via `run_seeded` inside `invoke_evaluation` makes the
+#' results identical to the serial path regardless of core count. Errors
+#' raised inside forked workers are re-thrown here so parallel failure
+#' behavior matches serial.
+#'
+#' @keywords internal
+evaluate_points <- function(specs, sim_fun, bounds, objective, constraint_tbl,
+                            fidelity_levels, ...) {
+  .cores <- effective_cores()
+  .map <- if (.cores > 1L) {
+    function(X, FUN) parallel::mclapply(X, FUN, mc.cores = .cores)
+  } else {
+    lapply
+  }
+  rows <- .map(specs, function(sp) {
+    invoke_evaluation(
+      sim_fun = sim_fun,
+      theta = sp$theta,
+      bounds = bounds,
+      objective = objective,
+      constraint_tbl = constraint_tbl,
+      fidelity = sp$fidelity,
+      fidelity_levels = fidelity_levels,
+      eval_id = sp$eval_id,
+      iter = sp$iter,
+      seed = sp$seed,
+      extra = sp$extra,
+      ...
+    )
+  })
+  # mclapply swallows worker errors into try-error objects; re-throw to match
+  # the serial path, where the first failing evaluation stops the run.
+  for (r in rows) {
+    if (inherits(r, "try-error")) {
+      cond <- attr(r, "condition")
+      stop(if (!is.null(cond)) conditionMessage(cond) else as.character(r),
+           call. = FALSE)
+    }
+  }
+  rows
+}
+
+#' Evaluate one design and append it to the history (serial convenience)
+#' @keywords internal
+record_evaluation <- function(history,
+                              sim_fun,
+                              theta,
+                              bounds,
+                              objective,
+                              constraint_tbl,
+                              fidelity,
+                              fidelity_levels,
+                              eval_id,
+                              iter,
+                              seed,
+                              progress,
+                              extra = NULL,
+                              ...) {
+  row <- invoke_evaluation(
+    sim_fun = sim_fun,
+    theta = theta,
+    bounds = bounds,
+    objective = objective,
+    constraint_tbl = constraint_tbl,
+    fidelity = fidelity,
+    fidelity_levels = fidelity_levels,
+    eval_id = eval_id,
+    iter = iter,
+    seed = seed,
+    extra = extra,
+    ...
+  )
+  if (progress) announce_evaluation(row, objective)
+  append_rows(history, list(row))
 }
 
 #' @keywords internal
 invoke_simulator <- function(sim_fun, theta, fidelity, n_rep, seed, ...) {
-  res <- sim_fun(theta, fidelity = fidelity, seed = seed, ...)
+  # Optional-argument n_rep contract (Task B1): forward the replication count only to
+  # simulators that declare an explicit n_rep formal. Dots alone do NOT opt in:
+  # forwarding wrappers (e.g. fix_parameters()) pass their dots verbatim to an
+  # inner simulator, so injecting n_rep into dots would leak it into legacy
+  # simulators that cannot accept it.
+  sim_args <- names(formals(sim_fun))
+  if ("n_rep" %in% sim_args) {
+    res <- sim_fun(theta, fidelity = fidelity, seed = seed, n_rep = n_rep, ...)
+  } else {
+    res <- sim_fun(theta, fidelity = fidelity, seed = seed, ...)
+  }
 
   variance <- attr(res, "variance", exact = TRUE)
   rep_attr <- attr(res, "n_rep", exact = TRUE)
@@ -1339,13 +2236,45 @@ validate_fidelity_levels <- function(fidelity_levels) {
   fidelity_levels
 }
 
+#' Unit coordinates of the best feasible design in the history
+#'
+#' Task C7: found by row index (which.min over feasible objectives), not by
+#' float-equality against the incumbent -- the BPM incumbent is a posterior
+#' mean that equals no observed objective, so an equality match found nothing
+#' and the hybrid_staged proximity bonus never fired.
+#'
+#' Mirrors the A8 incumbent semantics: high-fidelity feasible rows are
+#' preferred when any exist, falling back to any-fidelity feasible rows.
+#' Coordinates are rescaled from theta under the CURRENT bounds rather than
+#' read from the stored unit_x, which is stale when a previous-stage history
+#' was recorded under different (e.g. wider) bounds. Returns NULL when no
+#' feasible row with a non-NA objective exists.
+#'
+#' @keywords internal
+best_feasible_unit <- function(history, objective, bounds) {
+  feas <- history$feasible & !is.na(history[[objective]])
+  if ("fidelity" %in% names(history)) {
+    high <- feas & !is.na(history$fidelity) & history$fidelity == "high"
+    if (any(high)) feas <- high
+  }
+  feas_idx <- which(feas)
+  if (length(feas_idx) == 0) return(NULL)
+  best_row <- feas_idx[which.min(history[[objective]][feas_idx])]
+  unit <- unlist(scale_to_unit(history$theta[[best_row]], bounds))
+  # scale_to_unit follows the theta's own name order, but candidate rows are
+  # bounds-ordered and the distance subtraction is positional: return in
+  # names(bounds) order always.
+  unit[names(bounds)]
+}
+
 #' @keywords internal
 lhs_candidate_pool <- function(n, bounds) {
+  # Task C5: return the matrix directly. predict_surrogates and
+  # select_batch_local_penalization consume it without any per-candidate
+  # list round trip; rows index candidates, columns are named parameters.
   lhs <- lhs::randomLHS(n, length(bounds))
-  # OPTIMIZED: Set column names once on matrix, then use asplit for faster conversion
   colnames(lhs) <- names(bounds)
-  # asplit returns a list of named vectors more efficiently than lapply
-  asplit(lhs, 1)
+  lhs
 }
 
 #' Best feasible objective value using posterior mean (BPM) when available
@@ -1365,15 +2294,18 @@ best_feasible_objective <- function(history, objective, surrogates = NULL,
                                     incumbent_method = "bpm") {
   idx <- which(history$feasible)
 
-  # Optional: restrict to high-fidelity evaluations for stability
-
+  # Optional: prefer high-fidelity evaluations for stability, but fall back to
+  # the any-fidelity feasible best when no feasible high-fidelity eval exists.
+  # Returning Inf here (the previous behavior) flipped the acquisition into its
+  # "no feasible solution yet" mode even though feasible designs were known -
+  # common mid-run, since the initial design runs entirely at the lowest fidelity.
   if (high_fidelity_only && "fidelity" %in% names(history)) {
-    high_idx <- which(history$fidelity == "high")
-    idx <- intersect(idx, high_idx)
+    hf_idx <- intersect(idx, which(history$fidelity == "high"))
+    if (length(hf_idx) > 0L) idx <- hf_idx
   }
 
   if (length(idx) == 0L) {
-    return(Inf)
+    return(Inf)  # genuinely no feasible point at any fidelity
   }
 
   # BPM: Use posterior mean when surrogates available (reduces MC noise sensitivity)
@@ -1381,7 +2313,10 @@ best_feasible_objective <- function(history, objective, surrogates = NULL,
   if (incumbent_method == "bpm" && !is.null(surrogates) && objective %in% names(surrogates)) {
     # history$unit_x is a LIST COLUMN - subset with [idx] not [idx, , drop=FALSE]
     unit_x_feasible <- history$unit_x[idx]
-    pred <- predict_surrogates(surrogates, unit_x_feasible)
+    # Predict only the objective surrogate: the previous code predicted all m
+    # metrics here and discarded all but the objective (~75% wasted GP work per
+    # iteration). Subsetting the surrogate list preserves identical results.
+    pred <- predict_surrogates(surrogates[objective], unit_x_feasible)
     return(min(pred[[objective]]$mean, na.rm = TRUE))
   }
 

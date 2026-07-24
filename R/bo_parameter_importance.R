@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 # bo_parameter_importance.R
 # Parameter importance analysis for Bayesian optimization results
 #
@@ -249,40 +246,11 @@ compute_local_sensitivity <- function(fit, epsilon = 0.01, metric = NULL) {
 }
 
 
-#' Compute global sensitivity using Sobol indices
-#'
-#' Wrapper around compute_sobol_indices() with parameter importance interpretation.
-#' Uses variance-based decomposition to identify main effects and interactions.
-#'
-#' @param fit Result object from bo_calibrate()
-#' @param n_samples Number of samples for Sobol estimation (default: 1000)
-#' @param metric Which metric to analyze (default: objective metric)
-#'
-#' @return Data frame with columns:
-#'   - parameter: Parameter name
-#'   - first_order: First-order Sobol index (main effect)
-#'   - total_order: Total Sobol index (including interactions)
-#'   - interaction_strength: Difference (total - first_order)
-#'
-#' @export
-compute_global_sensitivity <- function(fit, n_samples = 1000, metric = NULL) {
-  if (!requireNamespace("sensitivity", quietly = TRUE)) {
-    warning("Package 'sensitivity' not available. Using local sensitivity only.")
-    return(NULL)
-  }
-
-  # Call existing Sobol computation function
-  sobol_result <- compute_sobol_indices(
-    fit = fit,
-    n_samples = n_samples,
-    metric = metric
-  )
-
-  # Add interaction strength
-  sobol_result$interaction_strength <- sobol_result$total_order - sobol_result$first_order
-
-  return(sobol_result)
-}
+# NOTE: compute_global_sensitivity() was removed (2026-07-23). It called
+# compute_sobol_indices(), which does not exist anywhere in the package, so it
+# errored unconditionally for every caller. For first-order Sobol indices use
+# sa_sobol(surrogates, bounds, outcome); for parameter importance use
+# compute_parameter_importance(). No working code depended on the removed export.
 
 
 #' Generate parameter recommendations (REMOVE, FIX, or OPTIMIZE)

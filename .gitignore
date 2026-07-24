@@ -1,3 +1,9 @@
 /doc/
 /Meta/
 .claude/
+# testthat run artifacts
+tests/testthat/_problems/
+tests/testthat/testthat-problems.rds
+BATON.Rcheck/
+BATON_0.5.0.tar.gz
+*.Rcheck/

@@ -17,18 +17,26 @@ library(BATON)
 #' @param theta Named list of design parameters (e.g., c(threshold = 2.0, alpha = 0.025))
 #' @param fidelity One of "low", "med", "high" controlling simulation replications
 #' @param seed Random seed for reproducibility
+#' @param n_rep Replication count passed by BATON when the simulator declares
+#'   this argument. When supplied it
+#'   overrides the fidelity switch below, so the simulator always honors the
+#'   package's `fidelity_levels` (including hybrid_staged escalation).
 #' @return Named vector of metrics with variance attribute
 simple_adaptive_simulator <- function(theta,
                                       fidelity = c("low", "med", "high"),
                                       seed = NULL,
+                                      n_rep = NULL,
                                       ...) {
   fidelity <- match.arg(fidelity)
 
-  # Determine number of replications based on fidelity
-  n_rep <- switch(fidelity,
-                  low = 200,
-                  med = 1000,
-                  high = 10000)
+  # Fall back to the package's default fidelity_levels when BATON did not
+  # pass an explicit replication count
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity,
+                    low = 2000,
+                    med = 4000,
+                    high = 10000)
+  }
 
   if (!is.null(seed)) set.seed(seed)
 
@@ -91,14 +99,17 @@ simple_adaptive_simulator <- function(theta,
 parallel_adaptive_simulator <- function(theta,
                                         fidelity = c("low", "med", "high"),
                                         seed = NULL,
+                                        n_rep = NULL,
                                         n_cores = 4,
                                         ...) {
   fidelity <- match.arg(fidelity)
 
-  n_rep <- switch(fidelity,
-                  low = 200,
-                  med = 1000,
-                  high = 10000)
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity,
+                    low = 2000,
+                    med = 4000,
+                    high = 10000)
+  }
 
   # Ensure reproducibility with parallel execution
   if (!is.null(seed)) {
@@ -156,9 +167,12 @@ parallel_adaptive_simulator <- function(theta,
 manual_welford_simulator <- function(theta,
                                      fidelity = c("low", "med", "high"),
                                      seed = NULL,
+                                     n_rep = NULL,
                                      ...) {
   fidelity <- match.arg(fidelity)
-  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
 
   if (!is.null(seed)) set.seed(seed)
 

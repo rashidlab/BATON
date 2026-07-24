@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Global sensitivity via Saltelli Sobol indices
 #'
 #' @param surrogates list of surrogate models (from [fit_surrogates()]).
@@ -9,7 +6,7 @@
 #' @param n_mc number of Monte Carlo samples.
 #'
 #' @return tibble with first-order Sobol indices per parameter.
-#' @importFrom rlang .data
+#' @importFrom dplyr .data
 #' @export
 sa_sobol <- function(surrogates,
                      bounds,
@@ -29,13 +26,11 @@ sa_sobol <- function(surrogates,
   colnames(A) <- param_names
   colnames(B) <- param_names
 
-  A_list <- unit_matrix_to_list(A)
-  B_list <- unit_matrix_to_list(B)
-
-  # Create subset with the actual outcome name, not the literal string "outcome"
-  surrogate_subset <- surrogates[outcome]  # Keep the original name
-  pred_A <- predict_surrogates(surrogate_subset, A_list)[[outcome]]$mean
-  pred_B <- predict_surrogates(surrogate_subset, B_list)[[outcome]]$mean
+  # Task C8: matrices go to predict_surrogates directly (no per-row list
+  # conversion), and all d Saltelli C-blocks are stacked into ONE predict.
+  surrogate_subset <- surrogates[outcome]  # keep the original name
+  pred_A <- predict_surrogates(surrogate_subset, A)[[outcome]]$mean
+  pred_B <- predict_surrogates(surrogate_subset, B)[[outcome]]$mean
 
   if (is.null(pred_A) || is.null(pred_B) || length(pred_A) == 0 || length(pred_B) == 0) {
     warning("Surrogate predictions returned NULL or empty; Sobol indices cannot be computed.",
@@ -50,17 +45,17 @@ sa_sobol <- function(surrogates,
     var_y <- max(var_y, 1e-8)
   }
 
-  indices <- purrr::map_dbl(seq_len(d), function(j) {
+  C_all <- do.call(rbind, lapply(seq_len(d), function(j) {
     C <- A
     C[, j] <- B[, j]
-    C_list <- unit_matrix_to_list(C)
-    pred_C <- predict_surrogates(surrogate_subset, C_list)[[outcome]]$mean
-    if (is.null(pred_C) || length(pred_C) == 0) {
-      return(NA_real_)
-    }
+    C
+  }))
+  pred_C_all <- predict_surrogates(surrogate_subset, C_all)[[outcome]]$mean
+  indices <- vapply(seq_len(d), function(j) {
+    pred_C <- pred_C_all[(j - 1L) * n_mc + seq_len(n_mc)]
     estimate <- mean(pred_B * (pred_C - pred_A)) / var_y
     max(0, min(1, estimate))
-  })
+  }, numeric(1))
 
   tibble::tibble(parameter = param_names, S_first = indices)
 }
@@ -88,20 +83,17 @@ sa_gradients <- function(surrogates,
   }
   theta_unit <- scale_to_unit(theta, bounds)
   param_names <- names(bounds)
-  model_list <- list(outcome = surrogates[[outcome]])
 
-  # OPTIMIZED: Use lapply + bind_rows instead of map_dfr
-  grad_list <- lapply(param_names, function(param) {
-    grad_info <- surrogate_gradient(model_list, theta_unit, bounds, param, eps)
-    tibble::tibble(
-      parameter = param,
-      gradient = grad_info$gradient,
-      sd = if (return_sd) grad_info$sd else NA_real_
-    )
-  })
-  gradients <- dplyr::bind_rows(grad_list)
+  # Task C8: all d finite differences in one predict call
+  points <- matrix(theta_unit[param_names], nrow = 1,
+                   dimnames = list(NULL, param_names))
+  bg <- batch_gradients(surrogates, bounds, outcome, points, eps)
 
-  gradients
+  tibble::tibble(
+    parameter = param_names,
+    gradient = as.numeric(bg$gradient[1, ]),
+    sd = if (return_sd) as.numeric(bg$sd[1, ]) else NA_real_
+  )
 }
 
 #' Covariance of gradient effects across the design space
@@ -130,13 +122,8 @@ cov_effects <- function(surrogates,
 
   points <- lhs::randomLHS(n_mc, d)
   colnames(points) <- param_names
-  # OPTIMIZED: Pre-allocate matrix instead of do.call(rbind, ...)
-  gradient_mat <- matrix(NA_real_, nrow = n_mc, ncol = d)
-  for (i in seq_len(n_mc)) {
-    theta_unit <- points[i, , drop = TRUE]
-    theta_list <- scale_from_unit(as.list(theta_unit), bounds)
-    gradient_mat[i, ] <- sa_gradients(surrogates, theta_list, bounds, outcome = outcome, eps = eps, return_sd = FALSE)$gradient
-  }
+  # Task C8: all n_mc x d finite differences in one predict call
+  gradient_mat <- batch_gradients(surrogates, bounds, outcome, points, eps)$gradient
   cov_mat <- stats::cov(gradient_mat)
   dimnames(cov_mat) <- list(param_names, param_names)
   cov_mat
@@ -211,6 +198,7 @@ sensitivity_diagnostics <- function(sim_fun,
 #' @return ggplot object.
 #' @export
 plot_sobol_indices <- function(sobol_tbl) {
+  require_suggests("ggplot2")
   ggplot2::ggplot(sobol_tbl, ggplot2::aes(x = .data$parameter, y = .data$S_first, fill = .data$parameter)) +
     ggplot2::geom_col(width = 0.6, show.legend = FALSE) +
     ggplot2::ylim(0, 1) +
@@ -223,6 +211,7 @@ plot_sobol_indices <- function(sobol_tbl) {
 #' @return ggplot object.
 #' @export
 plot_gradient_heatmap <- function(gradient_tbl) {
+  require_suggests("ggplot2")
   ggplot2::ggplot(gradient_tbl, ggplot2::aes(x = .data$parameter, y = .data$point_id, fill = .data$gradient)) +
     ggplot2::geom_tile() +
     ggplot2::scale_fill_gradient2(low = "#4575b4", mid = "#ffffbf", high = "#d73027", midpoint = 0) +
@@ -235,6 +224,7 @@ plot_gradient_heatmap <- function(gradient_tbl) {
 #' @return ggplot object.
 #' @export
 plot_kernel_comparison <- function(kernel_tbl) {
+  require_suggests("ggplot2")
   ggplot2::ggplot(kernel_tbl, ggplot2::aes(x = .data$kernel, y = .data$loglik, colour = .data$metric, group = .data$metric)) +
     ggplot2::geom_line() +
     ggplot2::geom_point(size = 2) +
@@ -247,6 +237,7 @@ plot_kernel_comparison <- function(kernel_tbl) {
 #' @return ggplot object.
 #' @export
 plot_acquisition_comparison <- function(acquisition_tbl) {
+  require_suggests("ggplot2")
   ggplot2::ggplot(acquisition_tbl, ggplot2::aes(x = .data$acquisition, y = .data$mean_score, fill = .data$acquisition)) +
     ggplot2::geom_col(width = 0.6, show.legend = FALSE) +
     ggplot2::geom_errorbar(ggplot2::aes(ymin = .data$mean_score - .data$sd_score,
@@ -257,28 +248,51 @@ plot_acquisition_comparison <- function(acquisition_tbl) {
 
 # --- internal utilities -----------------------------------------------------
 
-unit_matrix_to_list <- function(mat) {
-  param_names <- colnames(mat)
-  purrr::map(seq_len(nrow(mat)), function(i) {
-    vec <- mat[i, , drop = TRUE]
-    purrr::set_names(as.numeric(vec), param_names)
-  })
-}
+# Task C8: finite-difference gradients for ALL points and ALL parameters in
+# one predict per metric. The 2 * n * d up/down queries are stacked into a
+# single matrix (d up-blocks then d down-blocks, each n rows), predicted
+# once, and reshaped. Numerically identical to the old per-(point, param)
+# surrogate_gradient(): same clamping at the unit-cube boundary, same
+# raw-scale delta, same zero-gradient guard for degenerate deltas.
+batch_gradients <- function(surrogates, bounds, outcome, points_unit, eps) {
+  param_names <- colnames(points_unit)
+  n <- nrow(points_unit)
+  d <- ncol(points_unit)
 
-surrogate_gradient <- function(model_list, theta_unit, bounds, param, eps) {
-  up <- down <- theta_unit
-  up[param] <- min(1, up[param] + eps)
-  down[param] <- max(0, down[param] - eps)
-  if (abs(up[param] - down[param]) < 1e-8) {
-    return(list(gradient = 0, sd = 0))
-  }
-  preds <- predict_surrogates(model_list, list(up, down))[[1]]
-  theta_up <- scale_from_unit(as.list(up), bounds)
-  theta_down <- scale_from_unit(as.list(down), bounds)
-  delta <- as.numeric(theta_up[[param]] - theta_down[[param]])
-  grad <- (preds$mean[1] - preds$mean[2]) / delta
-  sd_grad <- sqrt(sum(preds$sd^2)) / delta
-  list(gradient = grad, sd = sd_grad)
+  ups <- lapply(seq_len(d), function(j) {
+    up <- points_unit
+    up[, j] <- pmin(1, up[, j] + eps)
+    up
+  })
+  downs <- lapply(seq_len(d), function(j) {
+    down <- points_unit
+    down[, j] <- pmax(0, down[, j] - eps)
+    down
+  })
+  queries <- rbind(do.call(rbind, ups), do.call(rbind, downs))
+  pred <- predict_surrogates(surrogates[outcome], queries)[[outcome]]
+
+  mean_up <- matrix(pred$mean[seq_len(n * d)], nrow = n)
+  mean_down <- matrix(pred$mean[n * d + seq_len(n * d)], nrow = n)
+  sd_up <- matrix(pred$sd[seq_len(n * d)], nrow = n)
+  sd_down <- matrix(pred$sd[n * d + seq_len(n * d)], nrow = n)
+
+  # Per-point unit-scale deltas (clamping makes them point-specific), then
+  # raw-scale deltas via the parameter widths.
+  unit_delta <- vapply(seq_len(d), function(j) ups[[j]][, j] - downs[[j]][, j],
+                       numeric(n))
+  unit_delta <- matrix(unit_delta, nrow = n)  # n x d (vapply drops dim at n=1)
+  widths <- vapply(bounds, function(b) as.numeric(b[2]) - as.numeric(b[1]),
+                   numeric(1))[param_names]
+  delta <- sweep(unit_delta, 2, widths, "*")
+
+  gradient <- (mean_up - mean_down) / delta
+  sd_grad <- sqrt(sd_up^2 + sd_down^2) / delta
+  degenerate <- unit_delta < 1e-8
+  gradient[degenerate] <- 0
+  sd_grad[degenerate] <- 0
+  dimnames(gradient) <- dimnames(sd_grad) <- list(NULL, param_names)
+  list(gradient = gradient, sd = sd_grad)
 }
 
 gradient_sampling <- function(surrogates, bounds, outcome, gradient_points, eps) {
@@ -286,17 +300,15 @@ gradient_sampling <- function(surrogates, bounds, outcome, gradient_points, eps)
   param_names <- names(bounds)
   samples <- lhs::randomLHS(gradient_points, d)
   colnames(samples) <- param_names
-  # OPTIMIZED: Use lapply + bind_rows instead of imap_dfr
-  sample_list <- lapply(seq_len(gradient_points), function(i) {
-    theta_unit <- samples[i, , drop = TRUE]
-    theta_list <- scale_from_unit(as.list(theta_unit), bounds)
-    grads <- sa_gradients(surrogates, theta_list, bounds, outcome = outcome, eps = eps, return_sd = FALSE)
-    grads |>
-      dplyr::mutate(point_id = i)
-  })
-  sample_tbl <- dplyr::bind_rows(sample_list)
-
-  sample_tbl
+  # Task C8: one predict for all points; same long format as before
+  # (rows ordered point-by-point, parameters in names(bounds) order)
+  bg <- batch_gradients(surrogates, bounds, outcome, samples, eps)
+  tibble::tibble(
+    parameter = rep(param_names, times = gradient_points),
+    gradient = as.numeric(t(bg$gradient)),
+    sd = NA_real_,
+    point_id = rep(seq_len(gradient_points), each = d)
+  )
 }
 
 kernel_comparison <- function(history, bounds, objective, constraints, kernel_options) {

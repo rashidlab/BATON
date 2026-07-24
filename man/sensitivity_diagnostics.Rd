@@ -22,13 +22,22 @@ sensitivity_diagnostics(
 }
 \arguments{
 \item{sim_fun}{callback with signature
-`function(theta, fidelity = c("low","med","high"), ...)` returning a named
-numeric vector of operating characteristics (e.g., `power`, `type1`, `EN`,
-`ET`). The function should attach attributes `variance` (named numeric
-vector of Monte Carlo variances) and `n_rep` (number of simulator
-replications) for best results. If `variance` is not provided, a binomial
-approximation is used for metrics in [0,1], and a small nugget is used for
-other metrics.}
+  `function(theta, fidelity = c("low","med","high"), ...)` returning a named
+  numeric vector of operating characteristics (e.g., `power`, `type1`, `EN`,
+  `ET`). The function should attach attributes `variance` (named numeric
+  vector of Monte Carlo variances) and `n_rep` (number of simulator
+  replications) for best results. If `variance` is not provided, a binomial
+  approximation is used for metrics in [0,1], and a small nugget is used for
+  other metrics.
+
+  Optionally, the simulator may declare an explicit `n_rep` argument. When
+  it does, BATON passes the requested replication count
+  `n_rep = fidelity_levels[[fidelity]]` (including dynamically escalated
+  values under `fidelity_method = "hybrid_staged"`), so the simulator can
+  honor the exact budget rather than re-deriving it from the fidelity
+  label. Accepting `...` alone does NOT opt in (this keeps wrappers that
+  forward `...` to legacy simulators working); simulators without an
+  `n_rep` formal are called exactly as before (backward compatible).}
 
 \item{bounds}{named list of length-two numeric vectors specifying lower and
 upper limits for each design parameter.}

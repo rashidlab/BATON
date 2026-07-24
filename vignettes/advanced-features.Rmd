@@ -1,10 +1,10 @@
 ---
-title: "Advanced Features in BATON (v0.3.0)"
+title: "Advanced Features in BATON"
 author: "BATON Development Team"
 date: "`r Sys.Date()`"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Advanced Features in BATON (v0.3.0)}
+  %\VignetteIndexEntry{Advanced Features in BATON}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
@@ -20,13 +20,18 @@ knitr::opts_chunk$set(
 
 # Introduction
 
-Version 0.3.0 of BATON introduces major performance improvements across three implementation phases, resulting in **50-70% overall efficiency gains**. This vignette demonstrates how to use the new features and provides guidance on when to apply different strategies.
+This vignette covers BATON's advanced machinery, current as of v0.7.0:
 
-Key improvements:
-- **Batch diversity** for parallel evaluations (10-20% fewer evaluations)
-- **Adaptive fidelity selection** with cost-awareness (15-25% better budget use)
-- **Performance optimizations**: warm-start, adaptive pool, early stopping (30-60% faster)
-- **Improved constraint handling** for difficult infeasible problems
+- **Batch diversity** for parallel evaluations (local penalization)
+- **Multi-fidelity selection** with cost-awareness (four methods)
+- **Performance optimizations**: warm-start, adaptive candidate pool, early stopping
+- **Improved constraint handling** for problems that start infeasible
+- **Service and long-run controls** (v0.7.0): walltime caps, checkpointing, error recovery
+
+All of the first four are on by default; this vignette explains what they do,
+how to tune them, and when to override the defaults. Sizing guidance
+(`n_init`, `budget`, fidelity levels) lives in the README's "Choosing Your
+Settings" and "Run Profiles" sections, which are the single source of truth.
 
 # Setup
 
@@ -39,12 +44,19 @@ library(dplyr)
 For this vignette, we'll use a toy simulator that mimics a clinical trial calibration problem:
 
 ```{r toy-simulator, eval=FALSE}
-toy_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
-  n_rep <- switch(fidelity,
-    low = 200,
-    med = 1000,
-    high = 10000
-  )
+toy_simulator <- function(theta, fidelity = "high", seed = NULL,
+                          n_rep = NULL, ...) {
+  # BATON passes the exact requested replication count via n_rep. The switch()
+  # is only a fallback for direct calls; keep it in sync with the
+  # fidelity_levels used in bo_calibrate() (here the package defaults).
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity,
+      low = 2000,
+      med = 4000,
+      high = 10000
+    )
+  }
+  if (!is.null(seed)) set.seed(seed)
 
   # Use Welford's algorithm for variance estimation
   result <- welford_mean_var(
@@ -55,7 +67,7 @@ toy_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
 
       # Operating characteristics (simplified)
       power <- plogis((threshold - 2.0) / 0.3 + rnorm(1, 0, 0.1))
-      type1 <- plogis((alpha - 0.03) / 0.01 + rnorm(1, 0, 0.1))
+      type1 <- plogis((alpha - 0.05) / 0.01 + rnorm(1, 0, 0.1))
       EN <- 100 + (threshold - 2.0)^2 * 50 + rnorm(1, 0, 5)
 
       c(power = power, type1 = type1, EN = EN)
@@ -92,7 +104,7 @@ When selecting multiple points in a batch (`q > 1`), a naive greedy approach sel
 
 ## The Solution: Local Penalization
 
-BATON v0.3.0 implements **local penalization** (González et al., AISTATS 2016), which ensures batch points are spatially diverse while maintaining high acquisition values.
+BATON implements **local penalization** (González et al., AISTATS 2016), which ensures batch points are spatially diverse while maintaining high acquisition values.
 
 ### How It Works
 
@@ -106,7 +118,7 @@ BATON v0.3.0 implements **local penalization** (González et al., AISTATS 2016),
 # Without diversity (greedy selection) - not recommended
 # This would cluster points in the same high-acquisition region
 
-# With diversity (local penalization) - default in v0.3.0
+# With diversity (local penalization) - the default whenever q > 1
 fit <- bo_calibrate(
   sim_fun = toy_simulator,
   bounds = bounds,
@@ -122,25 +134,20 @@ fit <- bo_calibrate(
 ### Visualizing Diversity
 
 ```{r plot-batch-diversity, eval=FALSE}
-# Extract batch iterations (iter > 0, group by iter)
+# The history tibble has one unpacked column per design parameter, so
+# threshold and alpha are regular columns
 batch_points <- fit$history %>%
-  filter(iter > 0) %>%
-  group_by(iter) %>%
-  mutate(batch_id = cur_group_id()) %>%
-  ungroup()
+  filter(iter > 0, iter <= 5)
 
-# Plot first few batches
-first_batches <- batch_points %>% filter(batch_id <= 5)
-
-ggplot(first_batches, aes(x = theta[[1]]$threshold, y = theta[[1]]$alpha)) +
-  geom_point(aes(color = factor(batch_id)), size = 3) +
-  facet_wrap(~batch_id, ncol = 5) +
+ggplot(batch_points, aes(x = threshold, y = alpha)) +
+  geom_point(aes(color = factor(iter)), size = 3) +
+  facet_wrap(~iter, ncol = 5) +
   labs(
     title = "Batch Diversity via Local Penalization",
-    subtitle = "Each facet shows one batch of 4 points",
+    subtitle = "Each facet shows one batch of q = 2 points",
     x = "Threshold",
     y = "Alpha",
-    color = "Batch"
+    color = "BO iteration"
   ) +
   theme_minimal()
 ```
@@ -169,10 +176,10 @@ Expected improvements with batch diversity:
 
 ## The Problem
 
-Previous versions used a "staged" approach with arbitrary iteration thresholds:
+A purely iteration-based ("staged") schedule uses arbitrary thresholds:
 - Iterations 1-30: low fidelity
-- Iterations 31-100: medium fidelity
-- Iterations 101+: high fidelity
+- Iterations 31-100: CV/boundary-triggered promotion
+- Iterations 101+: high fidelity near the optimum
 
 This ignores:
 - Computational cost differences between fidelity levels
@@ -181,18 +188,19 @@ This ignores:
 
 ## The Solution: Cost-Aware Adaptive Selection
 
-BATON v0.3.0 introduces **adaptive fidelity selection**, which chooses fidelity based on expected **value per unit cost**.
+BATON's default is **adaptive fidelity selection**, which chooses fidelity based on expected **value per unit cost**.
 
-### Three Methods Available
+### Four Methods Available
 
 ```{r fidelity-methods, eval=FALSE}
-# 1. Adaptive (RECOMMENDED) - cost-aware value-per-cost optimization
+# 1. Adaptive (RECOMMENDED, default) - cost-aware value-per-cost optimization
 fit_adaptive <- bo_calibrate(
   sim_fun = toy_simulator,
   bounds = bounds,
   objective = "EN",
   constraints = constraints,
-  fidelity_method = "adaptive",  # Default in v0.3.0
+  fidelity_method = "adaptive",
+  n_init = 10,
   budget = 50
 )
 
@@ -203,6 +211,7 @@ fit_staged <- bo_calibrate(
   objective = "EN",
   constraints = constraints,
   fidelity_method = "staged",
+  n_init = 10,
   budget = 50
 )
 
@@ -213,6 +222,19 @@ fit_threshold <- bo_calibrate(
   objective = "EN",
   constraints = constraints,
   fidelity_method = "threshold",
+  n_init = 10,
+  budget = 50
+)
+
+# 4. Hybrid staged - MCEM-inspired staging with CV-based escalation and
+#    dynamic scaling of the high tier
+fit_hybrid <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  fidelity_method = "hybrid_staged",
+  n_init = 10,
   budget = 50
 )
 ```
@@ -239,9 +261,14 @@ where exponent increases with:
 
 If your simulator has non-linear cost scaling (e.g., I/O overhead, parallelization), specify custom costs:
 
+By default, costs are proportional to replication counts:
+`fidelity_levels / min(fidelity_levels)`, which is 1:2:5 at the package
+defaults `c(low = 2000, med = 4000, high = 10000)`.
+
 ```{r custom-costs, eval=FALSE}
-# Scenario: High-fidelity has setup overhead
-# Instead of linear 1:5:50, costs are 1:3:20
+# Scenario: replications parallelize well at high fidelity, so the true cost
+# is sub-proportional. With these levels, proportional costs would be 1:5:50;
+# declare the measured 1:3:20 instead.
 fit_custom <- bo_calibrate(
   sim_fun = toy_simulator,
   bounds = bounds,
@@ -250,6 +277,7 @@ fit_custom <- bo_calibrate(
   fidelity_method = "adaptive",
   fidelity_levels = c(low = 200, med = 1000, high = 10000),
   fidelity_costs = c(low = 1, med = 3, high = 20),  # Custom costs
+  n_init = 10,
   budget = 50
 )
 ```
@@ -257,28 +285,21 @@ fit_custom <- bo_calibrate(
 ### Comparing Methods
 
 ```{r compare-fidelity-methods, eval=FALSE}
-# Run all three methods with same seed
-set.seed(42)
-fit_adaptive <- bo_calibrate(..., fidelity_method = "adaptive", budget = 50)
-
-set.seed(42)
-fit_staged <- bo_calibrate(..., fidelity_method = "staged", budget = 50)
-
-set.seed(42)
-fit_threshold <- bo_calibrate(..., fidelity_method = "threshold", budget = 50)
-
-# Compare final objective values
-tibble(
-  method = c("Adaptive", "Staged", "Threshold"),
+# Using the fits from the "Four Methods Available" chunk above (they share
+# bounds, constraints, and budget; pass the same `seed` for a fair race)
+tibble::tibble(
+  method = c("Adaptive", "Staged", "Threshold", "Hybrid staged"),
   best_objective = c(
-    min(fit_adaptive$history$objective[fit_adaptive$history$feasible]),
-    min(fit_staged$history$objective[fit_staged$history$feasible]),
-    min(fit_threshold$history$objective[fit_threshold$history$feasible])
+    fit_adaptive$best_objective,
+    fit_staged$best_objective,
+    fit_threshold$best_objective,
+    fit_hybrid$best_objective
   ),
   evaluations = c(
     nrow(fit_adaptive$history),
     nrow(fit_staged$history),
-    nrow(fit_threshold$history)
+    nrow(fit_threshold$history),
+    nrow(fit_hybrid$history)
   )
 )
 ```
@@ -303,7 +324,8 @@ fit_adaptive$history %>%
 bind_rows(
   fit_adaptive$history %>% mutate(method = "Adaptive"),
   fit_staged$history %>% mutate(method = "Staged"),
-  fit_threshold$history %>% mutate(method = "Threshold")
+  fit_threshold$history %>% mutate(method = "Threshold"),
+  fit_hybrid$history %>% mutate(method = "Hybrid staged")
 ) %>%
   ggplot(aes(x = fidelity, fill = method)) +
   geom_bar(position = "dodge") +
@@ -323,6 +345,7 @@ bind_rows(
 | **Adaptive** | Most use cases | Optimal cost-benefit, adapts to problem | More complex |
 | **Staged** | Simple problems, reproducibility | Easy to understand, predictable | Arbitrary thresholds |
 | **Threshold** | Legacy support | Simple | Ignores cost, iteration stage |
+| **Hybrid staged** | Tight constraints, long runs | Responsive CV-based escalation, dynamic high tier | Most moving parts |
 
 ### Impact
 
@@ -353,12 +376,13 @@ Each iteration, the Gaussian process must optimize hyperparameters (lengthscales
 - **Automatic** - no user intervention needed
 
 ```{r warm-start-example, eval=FALSE}
-# Warm-start is automatic in v0.3.0
+# Warm-start is automatic
 fit <- bo_calibrate(
   sim_fun = toy_simulator,
   bounds = bounds,
   objective = "EN",
   constraints = constraints,
+  n_init = 10,
   budget = 50
 )
 # Internally, GP hyperparameters are warm-started from iteration 2 onward
@@ -368,15 +392,16 @@ fit <- bo_calibrate(
 
 ### The Problem
 
-Fixed candidate pool size (default 2000) is:
-- Too small for high-dimensional problems → poor optimization
-- Too large for low-dimensional problems → wasted computation
+A fixed candidate pool size is:
+- Too small for high-dimensional problems (poor optimization)
+- Too large for low-dimensional problems (wasted computation)
 
 ### The Solution
 
-Pool size automatically scales with dimension: **500 × d** (clamped to [1000, 5000]).
-
-In the final 30% of iterations, pool size increases by 50% for precision refinement.
+Pool size automatically scales with dimension: **500 x d**, clamped to
+[1000, 5000]. In the final 30% of iterations, pool size increases by 50% for
+precision refinement. The `candidate_pool` argument only sets a floor
+(default 2000).
 
 ### Impact
 
@@ -386,7 +411,7 @@ In the final 30% of iterations, pool size increases by 50% for precision refinem
 - **Automatic** - no user intervention needed
 
 ```{r adaptive-pool-example, eval=FALSE}
-# For 2D problem: pool = 1000 (early), 1500 (late)
+# For 2D problem: pool = 2000 throughout (the candidate_pool floor binds)
 # For 5D problem: pool = 2500 (early), 3750 (late)
 # For 10D problem: pool = 5000 (early), 7500 (late)
 
@@ -395,6 +420,7 @@ fit <- bo_calibrate(
   bounds = bounds,  # 2D problem
   objective = "EN",
   constraints = constraints,
+  n_init = 10,
   budget = 50
 )
 # Pool size automatically determined based on dimensionality
@@ -408,39 +434,65 @@ Bayesian optimization continues until budget exhausted, even after convergence, 
 
 ### The Solution
 
-**Early stopping** monitors convergence and stops when:
+**Early stopping** monitors convergence and stops when either:
 
-1. **Patience-based**: No improvement > 0.01% for 20 iterations
-2. **Acquisition-based**: Max acquisition value < 1e-6
+1. **Improvement plateau**: the best feasible objective improves by less than
+   `threshold` (relative, default 1e-3 = 0.1%) over the last `patience`
+   iterations (default 5), for `consecutive` such checks (default 2). Sets
+   `fit$status = "early_stopped"`.
+2. **Acquisition flatline**: the maximum acquisition value among selected
+   candidates falls below `acq_rel * |incumbent objective|` (default
+   `acq_rel = 1e-3`; just `acq_rel` before any feasible point exists) for 3
+   consecutive iterations. Sets `fit$status = "acq_flatline"`.
+
+Checks begin after 3 BO iterations.
 
 ### Configuration
 
-- Patience: 10 iterations
-- Improvement threshold: 0.01% relative
-- Requires: 2 consecutive patience windows (20 iterations)
-- Acquisition threshold: 1e-6
+Every number is configurable through the `early_stop` list; the values below
+are the defaults:
+
+```{r early-stop-config, eval=FALSE}
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 100,
+  early_stop = list(
+    enabled = TRUE,
+    patience = 5,       # iterations per no-improvement check
+    threshold = 1e-3,   # 0.1% minimum relative improvement
+    consecutive = 2,    # failed checks required to stop
+    acq_rel = 1e-3      # acquisition flatline threshold (relative to incumbent)
+  )
+)
+
+# To disable early stopping entirely (Thorough profile):
+# early_stop = list(enabled = FALSE)
+```
 
 ### Impact
 
 - **Saves 10-30% of budget**
 - More consistent convergence behavior
 - Prevents waste on diminishing returns
-- **Automatic** - no user intervention needed
+- **Automatic** - on by default
 
 ```{r early-stopping-example, eval=FALSE}
-# Early stopping is automatic in v0.3.0
+# Early stopping is automatic
 fit <- bo_calibrate(
   sim_fun = toy_simulator,
   bounds = bounds,
   objective = "EN",
   constraints = constraints,
+  n_init = 10,
   budget = 100  # May stop before reaching 100
 )
 
-# Check if early stopping occurred
-if (nrow(fit$history) < 100) {
-  message("Early stopping triggered at iteration ", max(fit$history$iter))
-}
+# fit$status records why the run ended
+fit$status  # "early_stopped", "acq_flatline", or "budget_exhausted"
 ```
 
 ### Visualizing Convergence
@@ -507,6 +559,7 @@ fit <- bo_calibrate(
   bounds = bounds,
   objective = "EN",
   constraints = tight_constraints,  # Difficult constraints
+  n_init = 10,
   budget = 60
 )
 
@@ -520,25 +573,65 @@ fit$history %>%
   )
 ```
 
+# Feature 5: Service and Long-Run Controls (v0.7.0)
+
+For unattended, scheduled, or cluster runs, `bo_calibrate()` can cap
+walltime, checkpoint progress, survive simulator failures, and honor
+cooperative cancellation. Each control is documented in `?bo_calibrate`; the
+README's "Service and Long-Run Controls" section shows the resume-from-
+checkpoint pattern.
+
+```{r service-controls, eval=FALSE}
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 60,
+  max_walltime_s = 6 * 3600,    # graceful stop before the scheduler kills the job
+  checkpoint_fun = function(snap) saveRDS(snap, "checkpoint.rds"),
+  checkpoint_every = 5,         # snapshot every 5 BO iterations
+  on_error = "return_partial",  # keep completed evaluations if the simulator fails
+  callback = function(info) !file.exists("STOP"),  # return TRUE to continue
+  slim = TRUE                   # lightweight return: skips the final surrogate refit
+)
+
+# fit$status reports what ended the run: "budget_exhausted", "early_stopped",
+# "acq_flatline", "walltime", "cancelled", or "errored" (see fit$error_message)
+fit$status
+```
+
 # Complete Example: Putting It All Together
 
-Here's a complete example using all v0.3.0 features:
+Here's a complete runnable example combining the features above (the
+simulator is the toy from the Setup section, written in the canonical
+evaluator form):
 
 ```{r complete-example, eval=FALSE}
 library(BATON)
+library(dplyr)  # for the result-summary pipeline below
 
 # Define simulator with variance estimation
-my_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
-  n_rep <- switch(fidelity,
-    low = 200,
-    med = 1000,
-    high = 10000
-  )
+my_simulator <- function(theta, fidelity = "high", seed = NULL,
+                         n_rep = NULL, ...) {
+  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity,
+      low = 2000,
+      med = 4000,
+      high = 10000
+    )
+  }
+  if (!is.null(seed)) set.seed(seed)
 
   result <- welford_mean_var(
     sample_fn = function(i, theta) {
-      # Your trial simulation here
-      # Return c(power = ..., type1 = ..., EN = ...)
+      # One replicate of the toy trial (replace with YOUR design logic)
+      power <- plogis((theta$threshold - 2.0) / 0.3 + rnorm(1, 0, 0.1))
+      type1 <- plogis((theta$alpha - 0.05) / 0.01 + rnorm(1, 0, 0.1))
+      EN <- 100 + (theta$threshold - 2.0)^2 * 50 + rnorm(1, 0, 5)
+      c(power = power, type1 = type1, EN = EN)
     },
     n_samples = n_rep,
     theta = theta
@@ -546,12 +639,12 @@ my_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
 
   metrics <- result$mean
   attr(metrics, "variance") <- result$variance
-  attr(metrics, "n_rep") <- n_rep
+  attr(metrics, "n_rep") <- result$n
 
   return(metrics)
 }
 
-# Optimization with all new features
+# Optimization (all of the advanced features are automatic defaults)
 fit <- bo_calibrate(
   sim_fun = my_simulator,
   bounds = list(
@@ -563,24 +656,20 @@ fit <- bo_calibrate(
     power = c("ge", 0.8),
     type1 = c("le", 0.05)
   ),
-
-  # v0.3.0 Features (all automatic)
   n_init = 10,
   q = 2,  # Batch size
   budget = 50,  # Early stopping may use less
-  fidelity_method = "adaptive",  # Cost-aware fidelity
-
-  # Optional: Custom fidelity costs
-  fidelity_costs = c(low = 1, med = 3, high = 20),
-
+  fidelity_method = "adaptive",  # Cost-aware fidelity (default)
   seed = 2025,
   progress = TRUE
 )
 
 # Inspect results
 print(fit$best_theta)
+fit$best_objective
+fit$status
 
-# Check if early stopping occurred
+# Check budget use (early stopping may end the run before 50 evaluations)
 message(sprintf(
   "Evaluations used: %d / %d (%.1f%%)",
   nrow(fit$history),
@@ -597,11 +686,11 @@ fit$history %>%
   filter(feasible) %>%
   mutate(best_so_far = cummin(objective)) %>%
   ggplot(aes(x = eval_id, y = best_so_far)) +
-  geom_line(size = 1, color = "blue") +
+  geom_line(linewidth = 1, color = "blue") +
   geom_point(aes(color = fidelity), size = 2) +
   labs(
     title = "Optimization Progress",
-    subtitle = sprintf("Final: EN = %.1f", fit$best_theta$objective),
+    subtitle = sprintf("Final: EN = %.1f", fit$best_objective),
     x = "Evaluation",
     y = "Best Objective (EN)",
     color = "Fidelity"
@@ -613,7 +702,7 @@ fit$history %>%
 
 ## Expected Improvements
 
-Version 0.3.0 provides substantial performance gains:
+Relative to disabling each feature, the defaults provide:
 
 | Component | Improvement | Measurement |
 |-----------|-------------|-------------|
@@ -627,69 +716,74 @@ Version 0.3.0 provides substantial performance gains:
 ## Benchmarking
 
 ```{r benchmark-example, eval=FALSE}
-library(tictoc)
-
-# Baseline (v0.2.0 equivalent)
-tic("v0.2.0 equivalent")
-fit_old <- bo_calibrate(
-  sim_fun = toy_simulator,
-  bounds = bounds,
-  objective = "EN",
-  constraints = constraints,
-  fidelity_method = "staged",
-  q = 1,  # No batch diversity
-  budget = 100  # No early stopping
+# Baseline configuration (staged fidelity, no batch diversity, no early stop)
+time_old <- system.time(
+  fit_old <- bo_calibrate(
+    sim_fun = toy_simulator,
+    bounds = bounds,
+    objective = "EN",
+    constraints = constraints,
+    fidelity_method = "staged",
+    q = 1,  # No batch diversity
+    n_init = 10,
+    budget = 100,
+    early_stop = list(enabled = FALSE),
+    seed = 42
+  )
 )
-time_old <- toc()
 
-# New (v0.3.0)
-tic("v0.3.0")
-fit_new <- bo_calibrate(
-  sim_fun = toy_simulator,
-  bounds = bounds,
-  objective = "EN",
-  constraints = constraints,
-  fidelity_method = "adaptive",
-  q = 2,  # Batch size
-  budget = 100  # May stop early
+# Current defaults (adaptive fidelity, batch diversity, early stopping)
+time_new <- system.time(
+  fit_new <- bo_calibrate(
+    sim_fun = toy_simulator,
+    bounds = bounds,
+    objective = "EN",
+    constraints = constraints,
+    fidelity_method = "adaptive",
+    q = 2,  # Batch size
+    n_init = 10,
+    budget = 100,  # May stop early
+    seed = 42
+  )
 )
-time_new <- toc()
 
 # Compare
-speedup <- (time_old$toc - time_old$tic) / (time_new$toc - time_new$tic)
+speedup <- time_old["elapsed"] / time_new["elapsed"]
 message(sprintf("Speedup: %.1fx faster", speedup))
 
 # Compare solution quality
 message(sprintf(
-  "v0.2.0: EN = %.1f (after %d evals)",
-  min(fit_old$history$objective[fit_old$history$feasible]),
+  "Baseline: EN = %.1f (after %d evals)",
+  fit_old$best_objective,
   nrow(fit_old$history)
 ))
 message(sprintf(
-  "v0.3.0: EN = %.1f (after %d evals)",
-  min(fit_new$history$objective[fit_new$history$feasible]),
+  "Defaults: EN = %.1f (after %d evals)",
+  fit_new$best_objective,
   nrow(fit_new$history)
 ))
 ```
 
 # Best Practices
 
-## Do's ✅
+## Do:
 
 1. **Use variance estimation** (`welford_mean_var`) for 30-50% better performance
 2. **Use adaptive fidelity** (default) unless you need simple staged thresholds
-3. **Set q ≥ 4** if you can evaluate in parallel
+3. **Set q = 4** if you can evaluate in parallel
 4. **Specify fidelity_costs** if your simulator has non-linear cost scaling
-5. **Let early stopping save budget** (automatic in v0.3.0)
-6. **Start with reasonable initial design** (n_init = 4-5 × dimension)
-7. **Validate results** with `estimate_constraint_reliability()`
+5. **Let early stopping save budget** (on by default)
+6. **Size n_init and budget by the README's "Run Profiles" table**
+   (Quick: n_init = 4-5 x d; Balanced/Thorough: 10 x d)
+7. **Validate results** with `multi_seed_verify = TRUE` or
+   `estimate_constraint_reliability()`
 
-## Don'ts ⚠️
+## Avoid:
 
 1. **Don't skip variance estimation** (significant performance loss)
 2. **Don't use staged method** unless you specifically need iteration thresholds
 3. **Don't set large q** without parallel evaluation capability (loses information gain)
-4. **Don't use too small initial design** (< 2 × dimension)
+4. **Don't use too small initial design** (< 2 x dimension)
 5. **Don't ignore infeasibility warnings**
 6. **Don't assume linear cost scaling** - measure and specify `fidelity_costs` if needed
 
@@ -700,15 +794,29 @@ message(sprintf(
 If optimization stops prematurely:
 
 ```{r troubleshoot-early-stop, eval=FALSE}
-# Current implementation uses:
-#   - Patience: 10 iterations
-#   - Improvement threshold: 0.01%
-#   - Requires: 2 consecutive patience windows
+# Defaults: patience = 5, threshold = 1e-3 (0.1%), consecutive = 2,
+# acq_rel = 1e-3. Relax them by widening the patience window or requiring
+# more consecutive failed checks:
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 100,
+  early_stop = list(patience = 10, consecutive = 3)
+)
 
-# Workaround: Increase budget to account for early stopping
-# If you want ~50 evaluations after early stopping, set budget = 70
-
-fit <- bo_calibrate(..., budget = 70)
+# Or disable early stopping entirely:
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 100,
+  early_stop = list(enabled = FALSE)
+)
 ```
 
 ## Batch Points Too Clustered
@@ -721,7 +829,14 @@ If batch diversity isn't sufficient:
 # very sharp peaks
 
 # Try: Larger initial design for better lengthscale estimation
-fit <- bo_calibrate(..., n_init = 6 * length(bounds))
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 6 * length(bounds),
+  budget = 60
+)
 ```
 
 ## Fidelity Selection Too Conservative
@@ -729,24 +844,41 @@ fit <- bo_calibrate(..., n_init = 6 * length(bounds))
 If adaptive method uses low fidelity too much:
 
 ```{r troubleshoot-fidelity, eval=FALSE}
-# Specify custom costs to encourage higher fidelity
+# Default costs are proportional to replications:
+# fidelity_levels / min(fidelity_levels), i.e. 1:2:5 at the default
+# c(low = 2000, med = 4000, high = 10000). Declaring the high tier cheaper
+# than proportional (e.g. when replications parallelize well) makes the
+# adaptive method escalate sooner:
 fit <- bo_calibrate(
-  ...,
-  fidelity_costs = c(low = 1, med = 2, high = 10)  # Less than default 1:5:50
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 60,
+  fidelity_costs = c(low = 1, med = 1.5, high = 3)  # cheaper than 1:2:5
 )
 
 # Or use staged method for predictable fidelity progression
-fit <- bo_calibrate(..., fidelity_method = "staged")
+fit <- bo_calibrate(
+  sim_fun = toy_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 10,
+  budget = 60,
+  fidelity_method = "staged"
+)
 ```
 
 # Further Reading
 
-- **PHASE1_IMPLEMENTATION_SUMMARY.md**: Acquisition & batch diversity details
-- **PHASE2_IMPLEMENTATION_SUMMARY.md**: Multi-fidelity strategy overhaul
-- **PHASE3_IMPLEMENTATION_SUMMARY.md**: Performance optimizations
-- **ALL_PHASES_COMPLETE.md**: Comprehensive analysis of all improvements
-- **PACKAGE_REVIEW_ANALYSIS.md**: Literature review and recommendations
-- **IMPLEMENTATION_PLAN.md**: Complete implementation roadmap
+- **README**: "Choosing Your Settings", "Run Profiles", "Before You Trust
+  the Answer", and "Service and Long-Run Controls" sections
+- **Other vignettes**: `vignette("BATON-introduction")`,
+  `vignette("variance-estimation")`, `vignette("v04-hardening")`
+- **Release notes**: `NEWS.md`
+- **Reference**: `?bo_calibrate` for every argument discussed here
 
 # References
 

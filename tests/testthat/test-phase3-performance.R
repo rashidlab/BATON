@@ -119,7 +119,7 @@ test_that("adaptive candidate pool size scales with dimension", {
   skip_if_not_installed("lhs")
 
   toy_sim_fun <- function(theta, fidelity = "high", seed = NULL, ...) {
-    x <- unlist(theta)
+    x <- as.numeric(unlist(theta))
     res <- c(power = 0.85, type1 = 0.05, EN = sum(x^2) * 100)
     attr(res, "variance") <- c(power = 0.001, type1 = 0.0005, EN = 0.5)
     attr(res, "n_rep") <- 100
@@ -158,7 +158,7 @@ test_that("adaptive candidate pool size scales with dimension", {
   fit_5d <- tryCatch({
     bo_calibrate(
       sim_fun = function(theta, ...) {
-        x <- unlist(theta)
+        x <- as.numeric(unlist(theta))
         res <- c(power = 0.85, type1 = 0.05, EN = sum(x^2) * 100)
         attr(res, "variance") <- c(power = 0.001, type1 = 0.0005, EN = 0.5)
         attr(res, "n_rep") <- 100
@@ -189,7 +189,7 @@ test_that("early stopping triggers when no improvement", {
 
   # Simulator that reaches optimum quickly
   toy_sim_fun <- function(theta, fidelity = "high", seed = NULL, ...) {
-    x <- unlist(theta)
+    x <- as.numeric(unlist(theta))
     # Optimum at (0.5, 0.5) with value = 0
     res <- c(
       power = 0.85,
@@ -335,7 +335,7 @@ test_that("Phase 3 features work together", {
 
   # Integration test with all Phase 3 features
   toy_sim_fun <- function(theta, fidelity = "high", seed = NULL, ...) {
-    x <- unlist(theta)
+    x <- as.numeric(unlist(theta))
     res <- c(
       power = 0.8 + 0.1 * (x[1] - 0.5),
       type1 = 0.05,

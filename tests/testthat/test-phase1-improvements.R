@@ -249,7 +249,7 @@ test_that("bo_calibrate uses batch diversity with q > 1", {
 
   # Simple test function
   toy_sim_fun <- function(theta, fidelity = "high", seed = NULL, ...) {
-    x <- unlist(theta)
+    x <- as.numeric(unlist(theta))
     power <- 0.8 + 0.1 * (x[1] - 0.5)
     type1 <- 0.05
     EN <- sum((x - 0.5)^2) * 100
@@ -294,7 +294,7 @@ test_that("batch diversity works with q=1 (no diversity needed)", {
   skip_if_not_installed("lhs")
 
   toy_sim_fun <- function(theta, fidelity = "high", seed = NULL, ...) {
-    x <- unlist(theta)
+    x <- as.numeric(unlist(theta))
     res <- c(power = 0.85, type1 = 0.05, EN = sum(x^2) * 100)
     attr(res, "variance") <- c(power = 0.001, type1 = 0.0005, EN = 0.5)
     attr(res, "n_rep") <- 100

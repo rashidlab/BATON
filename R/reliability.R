@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Estimate constraint reliability for calibrated designs
 #'
 #' Runs the requested calibration strategies across multiple seeds and
@@ -15,7 +12,7 @@
 #'
 #' @return An object of class `BATON_reliability` with components `summary`
 #'   (strategy-level feasibility rates) and `runs` (per-run records).
-#' @importFrom rlang .data
+#' @importFrom dplyr .data
 #' @export
 estimate_constraint_reliability <- function(sim_fun,
                                             bounds,
@@ -40,11 +37,13 @@ estimate_constraint_reliability <- function(sim_fun,
     stop("No valid strategies supplied.", call. = FALSE)
   }
 
-  runs <- purrr::imap_dfr(strategies, function(strategy, idx) {
+  # Base R lapply + bind_rows instead of purrr::imap_dfr/map_dfr (Task D9);
+  # the imap index was unused, so a plain lapply preserves semantics.
+  runs <- dplyr::bind_rows(lapply(strategies, function(strategy) {
     if (progress) {
       message(sprintf("Reliability: running '%s' across %d seed(s).", strategy, length(calibration_seeds)))
     }
-    purrr::map_dfr(calibration_seeds, function(seed) {
+    dplyr::bind_rows(lapply(calibration_seeds, function(seed) {
       calibration <- run_strategy(
         strategy = strategy,
         seed = seed,
@@ -85,8 +84,8 @@ estimate_constraint_reliability <- function(sim_fun,
         theta = list(calibration$best_theta),
         total_sim_calls = calibration$total_sim_calls + validation$n_rep
       )
-    })
-  })
+    }))
+  }))
 
   summary_tbl <- runs |>
     dplyr::group_by(.data$strategy) |>
@@ -114,6 +113,7 @@ estimate_constraint_reliability <- function(sim_fun,
 #' @return ggplot object visualising feasibility rates.
 #' @export
 plot_constraint_reliability <- function(reliability) {
+  require_suggests("ggplot2")
   stopifnot(inherits(reliability, "BATON_reliability"))
   ggplot2::ggplot(reliability$summary, ggplot2::aes(x = .data$strategy, y = .data$reliability, fill = .data$strategy)) +
     ggplot2::geom_col(width = 0.6) +
@@ -129,7 +129,9 @@ validate_design <- function(sim_fun, theta, objective, constraint_tbl, n_rep, se
   res <- sim_fun(theta, fidelity = "high", n_rep = n_rep, seed = seed, ...)
   variance <- attr(res, "variance", exact = TRUE)
   metrics <- if (is.list(res) && !is.null(res$metrics)) res$metrics else res
-  metrics <- metrics |> as.list() |> purrr::imap_dbl(function(value, name) as.numeric(value))
+  # Base R vapply instead of purrr::imap_dbl (Task D9); the name argument was
+  # unused and vapply preserves names just as imap_dbl did.
+  metrics <- vapply(as.list(metrics), as.numeric, numeric(1))
   feasible <- is_feasible(metrics, constraint_tbl)
   list(
     metrics = metrics,

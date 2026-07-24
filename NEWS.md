@@ -1,5 +1,197 @@
 # BATON Changelog
 
+## BATON 0.7.0 (2026-07-24)
+
+Service-readiness release (Phase D of the 2026-07 review plan): run controls
+for calibrations driven by a service or scheduler, RNG hygiene, and a lighter
+dependency footprint. Numerical output is unchanged: the golden-master
+calibration snapshot is byte-identical to v0.6.0.
+
+### Service controls
+
+- **`status` field.** Every `BATON_fit` records why the run ended:
+  `"budget_exhausted"`, `"early_stopped"`, `"acq_flatline"`, `"walltime"`,
+  `"cancelled"`, or `"errored"`.
+- **`max_walltime_s` graceful stop.** Optional walltime cap checked between
+  initial-design evaluation chunks and at the top of each BO iteration
+  (advisory, never preemptive: a running chunk or batch is not interrupted).
+  On trip the run returns a partial but internally consistent fit with
+  `status = "walltime"`, and Stage 4 multi-seed verification is skipped even
+  when `multi_seed_verify = TRUE` (it could dwarf the cap itself). With a
+  cap set, initial-design evaluation proceeds in worker-count chunks so the
+  check also fires during the init phase; with no cap, evaluation order and
+  seeds are bit-identical to v0.6.0.
+- **`callback` cooperative cancellation.** Optional hook invoked at the end
+  of each BO iteration with `iter`, `eval_count`, `best_objective` (the ECI
+  incumbent), `best_observed` (best observed feasible objective including
+  the just-completed batch), and `elapsed_s`. Return `TRUE` to continue;
+  any other value cancels after the current iteration with
+  `status = "cancelled"` and no completed work discarded. A callback error
+  warns and continues: a monitoring hook must not kill a paid run.
+- **`checkpoint_fun` resumable snapshots.** Every `checkpoint_every`
+  completed BO iterations the hook receives a slim `BATON_fit` snapshot
+  (`status = "checkpoint"`, full evaluation history, no GP objects). Resume
+  a saved checkpoint with `bo_calibrate(..., initial_history =
+  ckpt$history, n_init = nrow(ckpt$history))`.
+- **`on_error = "return_partial"`.** An error inside an evaluation round or
+  BO iteration (simulator failure, surrogate fitting failure) ends the run
+  gracefully: the fit comes back with `status = "errored"`, the condition
+  message in `error_message`, and every completed prior round preserved. A
+  failure inside a round loses only that round's evaluations. The default
+  `on_error = "stop"` propagates errors exactly as before.
+- **`slim = TRUE` lightweight return.** Drops `surrogates`, `diagnostics`,
+  and `multi_seed_runs` (km/hetGP objects carry closures and environments
+  that inflate `saveRDS` payloads) while keeping the decision content:
+  `history`, `best_theta`, `best_objective`, `policies`,
+  `multi_seed_summary`, `verdict`, and `status`. The final surrogate refit
+  is skipped entirely (nothing else consumes it), saving one full GP fit
+  per run. Slim fits stay resumable via `initial_history = fit$history`;
+  `sa_sobol()`, `sensitivity_diagnostics()`, and `extract_case_study()`
+  need a non-slim fit.
+
+### RNG hygiene
+
+- `bo_calibrate()` no longer clobbers the caller's RNG stream. With an
+  explicit `seed`, `.Random.seed` is restored on exit (success or error)
+  and the caller's stream is untouched. With `seed = NULL`, the stream
+  advances by exactly one draw (the internal seed draw), so back-to-back
+  `seed = NULL` runs remain independent replicates.
+
+### Dependency slimming
+
+- `ggplot2` and `randtoolbox` moved to Suggests; `purrr`, `tidyr`, and
+  `rlang` dropped entirely (all call sites replaced with base R).
+  Installation is lighter: the calibration core needs only DiceKriging,
+  hetGP, lhs, dplyr, and tibble. Plotting (`plot_*`) requires ggplot2 to be
+  installed and fails with an actionable install hint naming the calling
+  function when it is absent. The init-stopping GP test grid uses Sobol
+  points when randtoolbox is installed and falls back to random points
+  (with a message) otherwise; the LHS initial design is unaffected.
+
+## BATON 0.6.0 (2026-07-23)
+
+Completes the 2026-07 review plan: the Phase B contract changes and the
+Phase C performance work. All performance changes are gated by the
+golden-master calibration snapshot (byte-identical results before and after)
+and a core-count-independence test.
+
+### Performance (Phase C)
+
+- **Parallel simulator evaluation.** The initial design, warm-start top-up,
+  and BO batches evaluate through `evaluate_points()`, opt-in parallel via
+  `options(BATON.cores = k)` on Unix. Every simulator call runs under
+  `run_seeded()`, so results are identical serial vs parallel even for
+  simulators drawing from the ambient RNG stream. History rows are appended
+  in one bind per round instead of one per evaluation.
+- **Matrix candidate scoring.** `predict_surrogates()` accepts the candidate
+  matrix directly and the acquisition hot loop is list-free end to end
+  (measured 58% faster scoring of a 2000-candidate pool). Invalid candidates
+  now error instead of being silently dropped, which had misaligned
+  predictions with candidate indices.
+- **Matrix history aggregation.** Per-theta tibble construction in surrogate
+  fitting is replaced by a single `rowsum`-based pass with exact
+  `mean(na.rm = TRUE)` semantics (all-NA groups stay NaN).
+- **Batched sensitivity predicts.** `sa_sobol()`, `sa_gradients()`,
+  `cov_effects()`, and gradient sampling issue one predict per metric
+  instead of one per (point, parameter) -- measured 36x faster gradient
+  covariance estimation.
+- **hybrid_staged proximity bonus now fires.** The distance-to-best lookup
+  matched rows by float equality against the posterior-mean incumbent and
+  never matched; it now finds the best feasible row by index (preferring
+  high-fidelity rows, rescaled under current bounds, bounds-ordered).
+
+### Fixes
+
+- Ablation policies with a subset of fidelity levels (e.g.
+  `low_only = c(low = 500)`) are normalized onto the low/med/high contract
+  instead of erroring.
+- Histories without a `variance` column keep their homoskedastic km fit
+  (a regression during the aggregation rewrite would have silently
+  downgraded them to constant predictors).
+- Warm-start top-up replenishes dedup rejections, detects true design-space
+  exhaustion for integer grids (including `round()` reach outside
+  non-integral bounds), and never underfills `n_init` while distinct
+  designs remain.
+
+### Contract changes (Phase B of the 2026-07 review plan)
+
+- **Optional `n_rep` simulator argument.** `bo_calibrate()` now passes the
+  requested replication count (`fidelity_levels[[fidelity]]`, including
+  hybrid_staged escalated values) to simulators that declare an explicit
+  `n_rep` formal. Accepting `...` alone does not opt in, so wrappers that
+  forward dots to legacy simulators keep working; simulators without the
+  argument are called exactly as before. `fix_parameters()` wrappers pass
+  `n_rep` through when both caller and wrapped simulator support it.
+- **Warm-start seeds augment the LHS initial design.** `warmstart_from` /
+  `initial_history` rows no longer replace the initial design: when fewer than
+  `n_init` rows are provided, fresh LHS points (deduplicated against donor
+  designs and against integer-coerced duplicates, with re-seeded replenishment
+  rounds) top up the design to `n_init`. Histories with `n_init` or more rows
+  are used as-is, preserving multi-stage warm-starting with narrowed bounds.
+
+## BATON 0.5.0 (2026-07-23)
+
+Correctness and performance release from a full-package code review. All
+changes are covered by new regression tests; a golden-master calibration
+snapshot (with a core-count-independence check) guards the numerical output.
+
+### Performance
+
+- **Warm-start now functions.** `parinit` was passed inside `km()`'s `control`
+  list, which DiceKriging ignores, so the advertised v0.3.0 warm-start was a
+  no-op and every iteration paid a full cold-start MLE. It is now a top-level
+  `km()` argument (and `mleHetGP`/`mleHomGP` are seeded from the previous
+  `theta`), giving ~30-50% faster surrogate fitting (measured ~34% at n=120,
+  d=6).
+- **Opt-in parallel GP fitting.** The `m` per-metric fits can run concurrently
+  via `options(BATON.cores = k)` on Unix. Each fit runs under a deterministic
+  seed (`run_seeded()`), so results are identical regardless of core count -
+  reproducibility does not depend on the host.
+- **Objective-only incumbent.** `best_feasible_objective()` predicted all `m`
+  surrogates and used only the objective; it now predicts just the objective.
+
+### Correctness
+
+- **Local penalization sign corrected.** The batch-diversity penalty grew with
+  distance, so `q > 1` batches clustered around the first pick (opposite of
+  Gonzalez et al. 2016); batches now spread out.
+- **Expected constraint violation** now uses the correct Gaussian expected
+  shortfall `sd*(z*Phi(z)+phi(z))` instead of a form that collapsed to
+  `sd*phi(z)` (which peaked at the boundary and vanished for deeply infeasible
+  points).
+- **Welford utilities:** `welford_mean_var()` matches metrics by name (was
+  positional); `pool_welford_results()` handles `n=1` chunks (was NA-poisoning).
+- **`theta_to_id()`** uses fixed-notation per-coordinate formatting, stable at
+  bound edges and across session options (duplicate detection no longer breaks).
+- **Multi-seed verification** accepts the documented named-vector simulator
+  contract (previously crashed with `$ operator is invalid for atomic vectors`
+  after the full budget was spent).
+- **Incumbent fidelity fallback:** returns the any-fidelity feasible best when
+  no feasible high-fidelity evaluation exists, instead of `Inf`.
+- **Early stopping:** the improvement check no longer compares across the
+  infeasible-to-feasible transition, and the acquisition-flatline threshold is
+  now relative to the incumbent (new `early_stop$acq_rel`, default 1e-3).
+- **`bo_calibrate_philosophies()`** isolates per-philosophy failures (one
+  failure no longer discards completed fits; errored fits get
+  `status = "errored"` / verdict `"ERRORED"`), and donor warm-start attaches the
+  operating characteristics of `best_theta`'s own evaluation.
+- **`warmstart_from` path fixed.** `build_initial_history_from_warmstart()`
+  initialised a 0-row data frame and threw `replacement has 1 row, data has 0`
+  for every warmstart call; it now seeds the correct row count.
+- **`is_feasible()`** is robust to atomic metric vectors with missing names
+  (was an opaque `subscript out of bounds`; now surfaces the clear
+  name-contract error).
+- **`parse_constraints()`** validates input (rejects unnamed lists, non-numeric
+  or non-finite thresholds, malformed entries) instead of silently producing
+  `NA` feasibility.
+- Removed the always-erroring `compute_global_sensitivity()` export (it called
+  a function that does not exist); use `sa_sobol()` or
+  `compute_parameter_importance()`.
+- Benchmark grid/random/heuristic arms no longer crash on the documented
+  named-vector fidelity input.
+- Unknown (`NA`) noise is imputed with the maximum observed noise, not the
+  minimum (unknown-variance points are now trusted least, not most).
+
 ## BATON 0.4.0 (2026-05-09)
 
 ### Hardening release: cross-philosophy warmstart + multi-seed verification

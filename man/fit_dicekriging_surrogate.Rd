@@ -12,7 +12,8 @@ fit_dicekriging_surrogate(
   covtype,
   noise,
   values,
-  prev_model = NULL
+  prev_model = NULL,
+  fit_seed = NULL
 )
 }
 \description{

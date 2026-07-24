@@ -28,8 +28,13 @@ ablation_multifidelity(
 \item{constraints}{constraint specification (see [bo_calibrate()]).}
 
 \item{policies}{named list mapping policy name to a named numeric vector of
-fidelity levels (passed to the `fidelity_levels` argument of
-[bo_calibrate()]).}
+fidelity levels. Names must be a subset of `low`, `med`, `high`. Partial
+policies are normalized onto the full low/med/high contract expected by
+[bo_calibrate()]: each missing level inherits the nearest provided level
+at or below it (else the smallest provided). So `c(low = 500)` simulates
+500 replications regardless of which fidelity the optimizer nominally
+selects, and `c(low = 200, high = 1000)` treats a `med` selection as
+another `low`-cost evaluation.}
 
 \item{seeds}{integer vector of seeds used for each replicate.}
 

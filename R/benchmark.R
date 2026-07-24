@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Benchmark calibration strategies across repeated runs
 #'
 #' Executes the Bayesian optimisation routine alongside baseline strategies
@@ -28,7 +25,7 @@
 #'
 #' @return An object of class `BATON_benchmark` with components `results`
 #'   (tibble of run-level records) and `call`.
-#' @importFrom rlang .data
+#' @importFrom dplyr .data
 #' @export
 benchmark_methods <- function(sim_fun,
                               bounds,
@@ -43,6 +40,35 @@ benchmark_methods <- function(sim_fun,
                               integer_params = NULL,
                               progress = TRUE,
                               ...) {
+  # Guard against bo_calibrate() arguments arriving via ... instead of bo_args.
+  # None of these can ever legitimately reach sim_fun through this path:
+  # "seed" always collides with the framework-supplied seed (invoke_simulator
+  # passes seed = seed explicitly, and the "bo" strategy sets seed in args), and
+  # "budget"/"n_init"/"q" are bo_calibrate formals, so for the "bo" strategy
+  # do.call() captures them there (silently overriding or colliding with
+  # bo_args) while the baseline strategies ignore them entirely.
+  dots <- list(...)
+  misplaced <- intersect(names(dots), c("budget", "n_init", "q", "seed"))
+  if (length(misplaced) > 0) {
+    others <- setdiff(misplaced, "seed")
+    msgs <- character(0)
+    if (length(others) > 0) {
+      msgs <- c(msgs, sprintf(
+        paste0("Argument(s) %s must be passed inside bo_args = list(...), ",
+               "not directly to benchmark_methods()."),
+        paste(sprintf("'%s'", others), collapse = ", ")
+      ))
+    }
+    if ("seed" %in% misplaced) {
+      msgs <- c(msgs, paste0(
+        "'seed' is not accepted directly by benchmark_methods(): use ",
+        "bo_args = list(seed = ...) for a fixed BO seed, or seeds = c(...) ",
+        "inside the relevant strategy args for replication seeds."
+      ))
+    }
+    stop(paste(msgs, collapse = " "), call. = FALSE)
+  }
+
   validate_bounds(bounds)
   constraint_tbl <- parse_constraints(constraints)
   available <- c("bo", "grid", "random", "heuristic")
@@ -51,12 +77,14 @@ benchmark_methods <- function(sim_fun,
     stop("No valid strategies supplied.", call. = FALSE)
   }
 
-  runs <- purrr::imap_dfr(strategies, function(strategy, idx) {
+  # Base R lapply + bind_rows instead of purrr::imap_dfr/map_dfr (Task D9);
+  # the imap index was unused, so a plain lapply preserves semantics.
+  runs <- dplyr::bind_rows(lapply(strategies, function(strategy) {
     seeds <- strategy_seeds(strategy, bo_args, grid_args, random_args, heuristic_args)
     if (progress) {
       message(sprintf("Running strategy '%s' with %d replicate(s).", strategy, length(seeds)))
     }
-    purrr::map_dfr(seeds, function(seed) {
+    dplyr::bind_rows(lapply(seeds, function(seed) {
       result <- run_strategy(
         strategy = strategy,
         seed = seed,
@@ -84,8 +112,8 @@ benchmark_methods <- function(sim_fun,
         total_sim_calls = result$total_sim_calls,
         history = list(result$history)
       )
-    })
-  })
+    }))
+  }))
 
   structure(
     list(
@@ -105,9 +133,17 @@ summarise_benchmark <- function(benchmark) {
   if (is.null(results) || nrow(results) == 0L) {
     return(tibble::tibble())
   }
-  expanded <- results |>
-    tidyr::unnest_wider(best_metrics, names_sep = "_") |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("best_metrics_"), ~ tidyr::replace_na(.x, NA_real_)))
+  # Base R replacement for tidyr::unnest_wider(best_metrics, names_sep = "_")
+  # (Task D9): one numeric column per metric name observed across runs, with
+  # NA_real_ where a run lacks that metric (the old replace_na normalization).
+  metric_names <- unique(unlist(lapply(results$best_metrics, names)))
+  expanded <- results
+  for (nm in metric_names) {
+    expanded[[paste0("best_metrics_", nm)]] <- vapply(results$best_metrics, function(m) {
+      if (is.null(m) || !(nm %in% names(m))) NA_real_ else as.numeric(m[[nm]])
+    }, numeric(1))
+  }
+  expanded$best_metrics <- NULL
 
   metric_cols <- grep("^best_metrics_", names(expanded), value = TRUE)
 
@@ -134,16 +170,18 @@ summarise_benchmark <- function(benchmark) {
 #' @return ggplot object.
 #' @export
 plot_benchmark_trajectory <- function(benchmark) {
+  require_suggests("ggplot2")
   stopifnot(inherits(benchmark, "BATON_benchmark"))
-  history_tbl <- purrr::pmap_dfr(
-    list(benchmark$results$strategy, benchmark$results$run_id, benchmark$results$history),
+  # Base R Map + bind_rows instead of purrr::pmap_dfr (Task D9).
+  history_tbl <- dplyr::bind_rows(Map(
     function(strategy, run_id, history) {
       if (nrow(history) == 0L) {
         return(NULL)
       }
       history |> dplyr::mutate(strategy = strategy, run_id = run_id)
-    }
-  )
+    },
+    benchmark$results$strategy, benchmark$results$run_id, benchmark$results$history
+  ))
 
   if (nrow(history_tbl) == 0L) {
     return(ggplot2::ggplot())
@@ -165,6 +203,7 @@ plot_benchmark_trajectory <- function(benchmark) {
 #' @return ggplot object.
 #' @export
 plot_benchmark_efficiency <- function(benchmark) {
+  require_suggests("ggplot2")
   summary_tbl <- summarise_benchmark(benchmark)
   ggplot2::ggplot(summary_tbl, ggplot2::aes(x = .data$sims_mean, y = .data$objective_mean, colour = .data$strategy)) +
     ggplot2::geom_point(size = 3) +
@@ -254,7 +293,7 @@ run_strategy <- function(strategy,
         objective = objective,
         constraint_tbl = constraint_tbl,
         fidelity = "high",
-        fidelity_levels = c(high = simulators_per_eval$grid %||% 10000),
+        fidelity_levels = c(high = unname(simulators_per_eval$grid %||% 10000)),
         eval_id = eval_counter,
         iter = 0L,
         seed = seed + eval_counter,
@@ -289,7 +328,7 @@ run_strategy <- function(strategy,
         objective = objective,
         constraint_tbl = constraint_tbl,
         fidelity = "high",
-        fidelity_levels = c(high = simulators_per_eval$random %||% 10000),
+        fidelity_levels = c(high = unname(simulators_per_eval$random %||% 10000)),
         eval_id = eval_counter,
         iter = 0L,
         seed = seed + eval_counter,
@@ -322,7 +361,7 @@ run_strategy <- function(strategy,
         objective = objective,
         constraint_tbl = constraint_tbl,
         fidelity = "high",
-        fidelity_levels = c(high = simulators_per_eval$heuristic %||% 10000),
+        fidelity_levels = c(high = unname(simulators_per_eval$heuristic %||% 10000)),
         eval_id = eval_counter,
         iter = 0L,
         seed = seed + eval_counter,
@@ -349,22 +388,24 @@ expand_grid_points <- function(bounds, resolution) {
     stop("`resolution` must be provided for grid search.", call. = FALSE)
   }
   params <- names(bounds)
-  grids <- purrr::map2(bounds, params, function(range, name) {
+  # Base R Map instead of purrr::map2 (Task D9).
+  grids <- Map(function(range, name) {
     res <- if (is.null(names(resolution))) resolution[[1L]] else resolution[[name]] %||% resolution[[1L]]
     if (!is.numeric(res) || res <= 0) {
       stop(sprintf("Grid resolution for '%s' must be positive.", name), call. = FALSE)
     }
     seq(range[[1]], range[[2]], length.out = res)
-  })
+  }, bounds, params)
   names(grids) <- params
   combos <- do.call(expand.grid, c(grids, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE))
-  purrr::map(seq_len(nrow(combos)), function(i) {
-    purrr::set_names(as.list(combos[i, , drop = TRUE]), params)
+  lapply(seq_len(nrow(combos)), function(i) {
+    stats::setNames(as.list(combos[i, , drop = TRUE]), params)
   })
 }
 
 heuristic_templates <- function(bounds, template) {
-  mid <- purrr::map(bounds, ~ mean(.x))
+  # Base R lapply + setNames instead of purrr::map/set_names (Task D9).
+  mid <- lapply(bounds, mean)
   templates <- list(mid)
   clip <- function(value, range) {
     min(max(value, range[[1]]), range[[2]])
@@ -373,12 +414,12 @@ heuristic_templates <- function(bounds, template) {
     templates <- c(
       templates,
       list(
-        purrr::map(bounds, ~ clip(.x[[2]] * 0.9, .x)),
-        purrr::map(bounds, ~ clip(.x[[1]] * 1.05, .x))
+        lapply(bounds, function(range) clip(range[[2]] * 0.9, range)),
+        lapply(bounds, function(range) clip(range[[1]] * 1.05, range))
       )
     )
   }
-  purrr::map(templates, purrr::set_names, names(bounds))
+  lapply(templates, stats::setNames, names(bounds))
 }
 
 modify_list <- function(base, overlay) {

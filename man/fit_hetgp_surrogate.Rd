@@ -10,7 +10,8 @@ fit_hetgp_surrogate(
   id_groups,
   param_names,
   covtype,
-  prev_model = NULL
+  prev_model = NULL,
+  fit_seed = NULL
 )
 }
 \description{

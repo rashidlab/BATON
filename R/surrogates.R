@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Fit Gaussian process surrogates for operating characteristics
 #'
 #' Implements heteroskedastic GP modeling when variance information is available,
@@ -17,6 +14,11 @@
 #' @param prev_surrogates optional list of surrogates from previous iteration
 #'   for warm-starting hyperparameter optimization. If provided, uses previous
 #'   hyperparameters as initial values, reducing optimization time by 30-50\%.
+#' @param fit_seed optional integer base seed for reproducible hyperparameter
+#'   fitting. When supplied, each metric's fit runs under a deterministic seed
+#'   (`fit_seed` + metric index), making results identical regardless of core
+#'   count when fits are parallelised via `options(BATON.cores)`. `NULL` (default)
+#'   leaves the RNG untouched.
 #'
 #' @return A named list of fitted surrogate models (GP objects).
 #' @export
@@ -25,7 +27,8 @@ fit_surrogates <- function(history,
                            constraint_tbl,
                            covtype = "matern5_2",
                            use_hetgp = TRUE,
-                           prev_surrogates = NULL) {
+                           prev_surrogates = NULL,
+                           fit_seed = NULL) {
   if (nrow(history) == 0L) {
     stop("History is empty; cannot fit surrogates.", call. = FALSE)
   }
@@ -56,9 +59,23 @@ fit_surrogates <- function(history,
   has_hetgp <- requireNamespace("hetGP", quietly = TRUE)
   use_hetgp <- use_hetgp && has_hetgp
 
-  # Use lapply instead of purrr::map to avoid purrr's error wrapping
-  # which can cause confusing "In index: X" error messages
-  surrogates <- lapply(metrics_needed, function(metric) {
+  # The m per-metric fits are independent. They run concurrently when the caller
+  # opts in via options(BATON.cores = k) on Unix; the default k=1 keeps the serial
+  # path. Reproducibility is guaranteed regardless of core count by giving each fit
+  # a deterministic seed (fit_seed + metric index) so km/hetGP random starts do not
+  # depend on RNG-stream position or worker forking (see run_seeded()).
+  metric_index <- stats::setNames(seq_along(metrics_needed), metrics_needed)
+  .cores <- effective_cores()
+  .map <- if (.cores > 1L) {
+    function(X, FUN) parallel::mclapply(X, FUN, mc.cores = .cores)
+  } else {
+    lapply
+  }
+
+  # Use an explicit mapper (not purrr::map) to avoid purrr's error wrapping
+  # which can cause confusing "In index: X" error messages.
+  surrogates <- .map(metrics_needed, function(metric) {
+    metric_seed <- if (!is.null(fit_seed)) fit_seed + metric_index[[metric]] else NULL
     tryCatch({
       # OPTIMIZED: Extract values with vapply for type safety and speed
       values <- vapply(seq_along(history$metrics), function(i) {
@@ -69,13 +86,20 @@ fit_surrogates <- function(history,
         }, error = function(e) NA_real_)
       }, FUN.VALUE = numeric(1))
 
-      noise <- vapply(seq_along(history$variance), function(i) {
-        tryCatch({
-          var_list <- history$variance[[i]]
-          if (is.null(var_list) || !metric %in% names(var_list)) return(NA_real_)
-          as.numeric(var_list[[metric]])
-        }, error = function(e) NA_real_)
-      }, FUN.VALUE = numeric(1))
+      # variance is optional: a history without the column must take the
+      # homoskedastic nugget path (all-NA noise), not produce a length-0
+      # vector that breaks grouped aggregation downstream.
+      noise <- if (!"variance" %in% names(history)) {
+        rep(NA_real_, nrow(history))
+      } else {
+        vapply(seq_along(history$variance), function(i) {
+          tryCatch({
+            var_list <- history$variance[[i]]
+            if (is.null(var_list) || !metric %in% names(var_list)) return(NA_real_)
+            as.numeric(var_list[[metric]])
+          }, error = function(e) NA_real_)
+        }, FUN.VALUE = numeric(1))
+      }
 
       # Check if we have replicated observations (multiple evals at same theta)
       has_replicates <- any(vapply(id_groups, length, FUN.VALUE = integer(1)) > 1)
@@ -90,7 +114,8 @@ fit_surrogates <- function(history,
 
       if (use_hetgp && has_replicates && has_variance) {
         # Use hetGP with replicated observations
-        fit_hetgp_surrogate(history, metric, id_groups, param_names, covtype, prev_model)
+        fit_hetgp_surrogate(history, metric, id_groups, param_names, covtype,
+                            prev_model, fit_seed = metric_seed)
       } else {
         # Fall back to DiceKriging with aggregated observations
         if (use_hetgp && !has_variance && !isTRUE(getOption("BATON.homoskedastic_warned"))) {
@@ -98,7 +123,8 @@ fit_surrogates <- function(history,
           options(BATON.homoskedastic_warned = TRUE)
         }
         fit_dicekriging_surrogate(history, metric, id_groups, param_names,
-                                  covtype, noise, values, prev_model)
+                                  covtype, noise, values, prev_model,
+                                  fit_seed = metric_seed)
       }
     }, error = function(e) {
       # On any error, return constant predictor instead of failing
@@ -126,7 +152,8 @@ fit_surrogates <- function(history,
 
 #' Fit heteroskedastic GP using hetGP package
 #' @keywords internal
-fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype, prev_model = NULL) {
+fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype,
+                                prev_model = NULL, fit_seed = NULL) {
   # Prepare data with replicates
   X_list <- list()
   Z_list <- list()
@@ -190,13 +217,13 @@ fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype
                       "Matern5_2")  # default
 
   tryCatch({
-    hetGP::mleHetGP(
+    run_seeded(fit_seed, function() hetGP::mleHetGP(
       X = X_expanded,
       Z = Z_vec,
       covtype = hetgp_cov,
       settings = list(return.hom = TRUE),  # also return homoskedastic fit
       known = list(g = 1e-8)  # small nugget for numerical stability
-    )
+    ))
   }, error = function(e) {
     warning(sprintf("hetGP fit failed for metric '%s': %s\nFalling back to homoskedastic GP.",
                     metric, e$message), call. = FALSE)
@@ -226,14 +253,14 @@ fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype
                       metric, z_range), call. = FALSE)
       # Fall back to DiceKriging which handles constant data more gracefully
       return(tryCatch({
-        DiceKriging::km(
+        run_seeded(fit_seed, function() DiceKriging::km(
           design = X_agg,
           response = Z_agg,
           covtype = "matern5_2",
           nugget = 1e-4,  # Larger nugget for stability
           nugget.estim = FALSE,
           control = list(trace = FALSE)
-        )
+        ))
       }, error = function(e2) {
         # Ultimate fallback: return a dummy model that predicts the mean
         warning(sprintf("All GP fits failed for metric '%s'. Using constant predictor.", metric), call. = FALSE)
@@ -245,21 +272,21 @@ fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype
     }
 
     tryCatch({
-      hetGP::mleHomGP(X = X_agg, Z = Z_agg, covtype = hetgp_cov,
-                     known = list(g = 1e-6))
+      run_seeded(fit_seed, function() hetGP::mleHomGP(X = X_agg, Z = Z_agg,
+                     covtype = hetgp_cov, known = list(g = 1e-6)))
     }, error = function(e2) {
       warning(sprintf("mleHomGP also failed for metric '%s': %s\nUsing DiceKriging fallback.",
                       metric, e2$message), call. = FALSE)
       # Try DiceKriging as last resort before constant predictor
       tryCatch({
-        DiceKriging::km(
+        run_seeded(fit_seed, function() DiceKriging::km(
           design = X_agg,
           response = Z_agg,
           covtype = "matern5_2",
           nugget = 1e-4,
           nugget.estim = FALSE,
           control = list(trace = FALSE)
-        )
+        ))
       }, error = function(e3) {
         warning(sprintf("All GP fits failed for metric '%s'. Using constant predictor.", metric), call. = FALSE)
         structure(
@@ -271,82 +298,128 @@ fit_hetgp_surrogate <- function(history, metric, id_groups, param_names, covtype
   })
 }
 
+#' Run a fitting expression under a fixed RNG seed, restoring the stream after
+#'
+#' GP hyperparameter optimizers use random starts (km cold-start, mleHetGP), so
+#' without a fixed seed the result depends on RNG-stream position - which differs
+#' between a serial lapply and forked mclapply workers, making calibration
+#' core-count-dependent. This isolates each fit under a deterministic seed and
+#' restores the caller's RNG state on exit, so results are identical regardless
+#' of execution order or parallelism. When `seed` is NULL, behaves as a plain call.
+#' @keywords internal
+run_seeded <- function(seed, fn) {
+  if (is.null(seed)) return(fn())
+  if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    old <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    on.exit(assign(".Random.seed", old, envir = .GlobalEnv), add = TRUE)
+  } else {
+    on.exit(suppressWarnings(rm(".Random.seed", envir = .GlobalEnv)), add = TRUE)
+  }
+  set.seed(seed)
+  fn()
+}
+
+#' NA-aware grouped means in one matrix pass
+#'
+#' Task C6: replaces the per-theta one-row-tibble + `bind_rows` aggregation.
+#' Matches `mean(x[group], na.rm = TRUE)` per group exactly, including the
+#' NaN result for all-NA groups (a plain `rowsum` would propagate NA into
+#' the surrogate inputs). Groups are returned ordered by sorted unique id,
+#' the same order `split()` produces.
+#'
+#' @keywords internal
+na_aware_group_mean <- function(x, ids) {
+  ok <- !is.na(x)
+  num <- rowsum(ifelse(ok, x, 0), ids, reorder = TRUE)
+  den <- rowsum(as.numeric(ok), ids, reorder = TRUE)
+  res <- as.numeric(num / den)  # 0/0 = NaN, matching mean(all-NA, na.rm=TRUE)
+  names(res) <- rownames(num)
+  res
+}
+
 #' Fit GP using DiceKriging (aggregated observations)
 #' @keywords internal
 fit_dicekriging_surrogate <- function(history, metric, id_groups, param_names,
-                                      covtype, noise, values, prev_model = NULL) {
-  # Aggregate by theta_id - with robust error handling
-  # Use base R lapply instead of purrr::imap to avoid "In index: X" errors
+                                      covtype, noise, values, prev_model = NULL,
+                                      fit_seed = NULL) {
+  # Task C6: aggregate by theta_id in one matrix pass (grouped means via
+  # rowsum) instead of building one tibble per unique theta and bind_rows-ing
+  # them (~1200 allocations per iteration on a mid-size history).
   group_names <- names(id_groups)
-  aggr_list <- lapply(seq_along(id_groups), function(i) {
-    idx <- id_groups[[i]]
-    id <- group_names[i]
-    tryCatch({
-      unit_theta <- history$unit_x[[idx[1]]]
-      # Ensure unit_theta is a proper numeric vector
-      if (is.null(unit_theta) || length(unit_theta) == 0) {
-        warning(sprintf("Empty unit_theta at theta_id '%s' (idx=%d)", id, idx[1]))
-        return(NULL)
-      }
-      tibble::tibble(
-        theta_id = id,
-        unit_x = list(as.numeric(unit_theta)),
-        value = mean(values[idx], na.rm = TRUE),
-        noise = if (all(is.na(noise[idx]))) NA_real_ else mean(noise[idx], na.rm = TRUE)
-      )
-    }, error = function(e) {
-      warning(sprintf("Error aggregating theta_id '%s': %s", id, e$message))
-      return(NULL)
-    })
-  })
+  n_groups <- length(group_names)
+  n_cols <- length(param_names)
 
-  # Filter out NULLs and bind
-  aggr_list <- aggr_list[!vapply(aggr_list, is.null, FUN.VALUE = logical(1))]
-  if (length(aggr_list) == 0) {
+  agg_value <- na_aware_group_mean(values, history$theta_id)
+  agg_noise <- na_aware_group_mean(noise, history$theta_id)
+  # Defensive alignment: both na_aware_group_mean and split() order groups by
+  # sorted unique id, but index by name so a divergence cannot misalign rows.
+  agg_value <- agg_value[group_names]
+  agg_noise <- agg_noise[group_names]
+
+  # First-occurrence design point per group, with the previous per-group
+  # guards (warn and drop the group rather than abort the whole fit).
+  X_all <- matrix(NA_real_, nrow = n_groups, ncol = n_cols)
+  ok_group <- rep(TRUE, n_groups)
+  for (i in seq_len(n_groups)) {
+    idx <- id_groups[[i]]
+    unit_theta <- history$unit_x[[idx[1]]]
+    if (is.null(unit_theta) || length(unit_theta) == 0) {
+      warning(sprintf("Empty unit_theta at theta_id '%s' (idx=%d)",
+                      group_names[i], idx[1]))
+      ok_group[i] <- FALSE
+      next
+    }
+    vec <- tryCatch(as.numeric(unit_theta), error = function(e) NULL)
+    if (is.null(vec)) {
+      warning(sprintf("Error aggregating theta_id '%s': non-numeric unit_x",
+                      group_names[i]))
+      ok_group[i] <- FALSE
+      next
+    }
+    if (length(vec) != n_cols) {
+      stop("Surrogate design dimension mismatch.", call. = FALSE)
+    }
+    X_all[i, ] <- vec
+  }
+
+  if (!any(ok_group)) {
     stop(sprintf("No valid observations to fit surrogate for metric '%s'", metric), call. = FALSE)
   }
-  aggr <- dplyr::bind_rows(aggr_list)
 
-  # Filter out rows with NA/NaN values (can happen when all observations at a theta are NA)
-  valid_rows <- !is.na(aggr$value) & !is.nan(aggr$value)
-  n_invalid <- sum(!valid_rows)
+  # Filter out groups with NA/NaN aggregate values (all observations NA)
+  value_ok <- !is.na(agg_value) & !is.nan(agg_value)
+  n_invalid <- sum(ok_group & !value_ok)
   if (n_invalid > 0) {
     message(sprintf("  [surrogate] Filtered %d/%d rows with NA/NaN values for metric '%s'",
-                    n_invalid, nrow(aggr), metric))
-    aggr <- aggr[valid_rows, , drop = FALSE]
+                    n_invalid, sum(ok_group), metric))
   }
+  keep <- ok_group & value_ok
 
   # Check if we have enough observations to fit a GP
-  if (nrow(aggr) < 2) {
+  if (sum(keep) < 2) {
     # Return a constant predictor if insufficient data
-    mean_val <- if (nrow(aggr) == 1) aggr$value[1] else NA_real_
+    mean_val <- if (sum(keep) == 1) unname(agg_value[keep][1]) else NA_real_
     message(sprintf("  [surrogate] Insufficient observations (%d) for GP - using constant predictor for '%s'",
-                    nrow(aggr), metric))
+                    sum(keep), metric))
     return(structure(
       list(mean_value = mean_val, metric = metric),
       class = "constant_predictor"
     ))
   }
 
-  # OPTIMIZED: Pre-allocate matrix instead of do.call(rbind, ...)
-  n_rows <- nrow(aggr)
-  n_cols <- length(param_names)
-  X_unique <- matrix(NA_real_, nrow = n_rows, ncol = n_cols)
-  for (i in seq_len(n_rows)) {
-    vec <- as.numeric(aggr$unit_x[[i]])
-    if (length(vec) != n_cols) {
-      stop("Surrogate design dimension mismatch.", call. = FALSE)
-    }
-    X_unique[i, ] <- vec
-  }
+  X_unique <- X_all[keep, , drop = FALSE]
   colnames(X_unique) <- param_names
+  aggr <- list(value = unname(agg_value[keep]))
 
-  noise_vec <- aggr$noise
+  noise_vec <- unname(agg_noise[keep])
   if (all(is.na(noise_vec))) {
     nugget <- 1e-6
     noise_vec <- NULL
   } else {
-    noise_vec[is.na(noise_vec)] <- min(noise_vec, na.rm = TRUE)
+    # Impute unknown (NA) noise with the LARGEST observed noise, not the
+    # smallest: an unknown-variance observation should be trusted least by the
+    # GP, not most. (min-imputation gave such points maximal weight.)
+    noise_vec[is.na(noise_vec)] <- max(noise_vec, na.rm = TRUE)
     noise_vec <- pmax(noise_vec, 1e-6)
     nugget <- 0
   }
@@ -366,31 +439,37 @@ fit_dicekriging_surrogate <- function(history, metric, id_groups, param_names,
                     length(aggr$value)))
   }
 
+  # Warm-start: parinit is a TOP-LEVEL km() argument, not a control entry
+  # (km ignores control$parinit entirely). Only pass it when it is a valid
+  # lengthscale vector of the right dimension; otherwise km cold-starts.
+  km_control <- list(trace = FALSE)
+  use_parinit <- !is.null(parinit) && is.numeric(parinit) &&
+    length(parinit) == ncol(X_unique) &&
+    all(is.finite(parinit)) && all(parinit > 0)
+
   tryCatch({
     if (is.null(noise_vec)) {
-      DiceKriging::km(
+      km_args <- list(
         design = X_unique,
         response = aggr$value,
         covtype = covtype,
         nugget = nugget,
         nugget.estim = FALSE,
-        control = list(
-          trace = FALSE,
-          parinit = parinit  # Warm start
-        )
+        control = km_control
       )
+      if (use_parinit) km_args$parinit <- parinit
+      run_seeded(fit_seed, function() do.call(DiceKriging::km, km_args))
     } else {
-      DiceKriging::km(
+      km_args <- list(
         design = X_unique,
         response = aggr$value,
         covtype = covtype,
         noise.var = noise_vec,
         nugget.estim = FALSE,
-        control = list(
-          trace = FALSE,
-          parinit = parinit  # Warm start
-        )
+        control = km_control
       )
+      if (use_parinit) km_args$parinit <- parinit
+      run_seeded(fit_seed, function() do.call(DiceKriging::km, km_args))
     }
   }, error = function(e) {
     stop(sprintf("Failed to fit surrogate for metric '%s': %s\nThis may indicate ill-conditioned data or insufficient observations.",
@@ -443,15 +522,18 @@ extract_gp_hyperparams <- function(model) {
 #' Handles both DiceKriging::km and hetGP::hetGP model objects.
 #' Optimized for batch prediction with minimal data frame overhead.
 #'
+#' `unit_x` is either a numeric matrix (rows = candidates, columns in the
+#' surrogate's parameter order, or named via `colnames`) or a list of named
+#' numeric vectors. The matrix path (Task C5) skips the per-candidate
+#' rebuild entirely and is what the acquisition hot loop uses. Invalid
+#' candidates are an ERROR on both paths: silently dropping rows would
+#' misalign the returned predictions with the caller's candidate indices
+#' (acquisition scores, batch selection).
+#'
 #' @keywords internal
 predict_surrogates <- function(surrogates, unit_x) {
   if (length(surrogates) == 0L) {
     stop("No surrogate models available for prediction.", call. = FALSE)
-  }
-
-  n_candidates <- length(unit_x)
-  if (n_candidates == 0L) {
-    stop("predict_surrogates: No candidate points provided", call. = FALSE)
   }
 
   # Detect model type from first non-constant surrogate to get param_names
@@ -468,48 +550,99 @@ predict_surrogates <- function(surrogates, unit_x) {
     }
   }
 
-  if (is.null(param_names)) {
-    param_names <- names(unit_x[[1]])
-  }
-
-  n_params <- length(param_names)
-
-  # OPTIMIZED: Build design matrix directly without per-candidate data.frame creation
-  # Pre-allocate matrix and fill row-by-row (much faster than lapply + rbind)
-  design_mat <- matrix(NA_real_, nrow = n_candidates, ncol = n_params)
-  colnames(design_mat) <- param_names
-
-  valid_rows <- rep(TRUE, n_candidates)
-  for (i in seq_len(n_candidates)) {
-    point <- unit_x[[i]]
-    tryCatch({
-      vec <- unlist(point)
-      if (is.null(vec) || length(vec) == 0) {
-        valid_rows[i] <- FALSE
-        next
-      }
-      if (is.null(names(vec))) {
-        names(vec) <- param_names
-      }
-      # Extract values in param_names order
-      if (all(param_names %in% names(vec))) {
-        design_mat[i, ] <- as.numeric(vec[param_names])
+  if (is.matrix(unit_x)) {
+    # Task C5 fast path: candidates already in matrix form.
+    n_candidates <- nrow(unit_x)
+    if (n_candidates == 0L) {
+      stop("predict_surrogates: No candidate points provided", call. = FALSE)
+    }
+    if (is.null(param_names)) {
+      param_names <- colnames(unit_x)
+    }
+    design_mat <- unit_x
+    if (!is.null(param_names)) {
+      if (!is.null(colnames(design_mat))) {
+        if (!all(param_names %in% colnames(design_mat))) {
+          stop(sprintf(
+            "predict_surrogates: candidate matrix is missing column(s): %s",
+            paste(setdiff(param_names, colnames(design_mat)), collapse = ", ")
+          ), call. = FALSE)
+        }
+        design_mat <- design_mat[, param_names, drop = FALSE]
+      } else if (ncol(design_mat) == length(param_names)) {
+        colnames(design_mat) <- param_names
       } else {
-        valid_rows[i] <- FALSE
+        stop(sprintf(
+          "predict_surrogates: candidate matrix has %d columns; expected %d (%s)",
+          ncol(design_mat), length(param_names),
+          paste(param_names, collapse = ", ")
+        ), call. = FALSE)
       }
-    }, error = function(e) {
-      valid_rows[i] <<- FALSE
-    })
-  }
+    }
+    if (!all(is.finite(design_mat))) {
+      bad <- which(!apply(is.finite(design_mat), 1, all))
+      stop(sprintf(
+        "predict_surrogates: non-finite candidate coordinates in row(s): %s",
+        paste(utils::head(bad, 5), collapse = ", ")
+      ), call. = FALSE)
+    }
+  } else {
+    n_candidates <- length(unit_x)
+    if (n_candidates == 0L) {
+      stop("predict_surrogates: No candidate points provided", call. = FALSE)
+    }
+    if (is.null(param_names)) {
+      param_names <- names(unit_x[[1]])
+    }
+    n_params <- length(param_names)
 
-  # Filter invalid rows if any
-  if (!all(valid_rows)) {
-    n_invalid <- sum(!valid_rows)
-    if (n_invalid > 0 && n_invalid < n_candidates) {
-      warning(sprintf("predict_surrogates: Filtered %d invalid points", n_invalid))
-      design_mat <- design_mat[valid_rows, , drop = FALSE]
-    } else if (n_invalid == n_candidates) {
-      stop("predict_surrogates: No valid design points", call. = FALSE)
+    # Build design matrix directly without per-candidate data.frame creation
+    design_mat <- matrix(NA_real_, nrow = n_candidates, ncol = n_params)
+    colnames(design_mat) <- param_names
+
+    invalid_rows <- integer(0)
+    for (i in seq_len(n_candidates)) {
+      point <- unit_x[[i]]
+      ok <- tryCatch({
+        vec <- unlist(point)
+        if (is.null(vec) || length(vec) == 0) {
+          FALSE
+        } else {
+          if (is.null(names(vec))) {
+            names(vec) <- param_names
+          }
+          # Extract values in param_names order
+          if (all(param_names %in% names(vec))) {
+            design_mat[i, ] <- as.numeric(vec[param_names])
+            TRUE
+          } else {
+            FALSE
+          }
+        }
+      }, error = function(e) FALSE)
+      if (!ok) invalid_rows <- c(invalid_rows, i)
+    }
+
+    # Invalid candidates are an error, never a silent drop: filtering rows
+    # would misalign predictions with the caller's candidate indices.
+    if (length(invalid_rows) > 0) {
+      stop(sprintf(
+        "predict_surrogates: %d invalid candidate point(s) (indices: %s). Each candidate must be a named numeric vector covering: %s.",
+        length(invalid_rows),
+        paste(utils::head(invalid_rows, 5), collapse = ", "),
+        paste(param_names, collapse = ", ")
+      ), call. = FALSE)
+    }
+
+    # Same finite check as the matrix path: correctly-named NA/Inf coordinates
+    # would otherwise reach the predictors, whose error fallback silently
+    # replaces predictions with constant high-uncertainty scores.
+    if (!all(is.finite(design_mat))) {
+      bad <- which(!apply(is.finite(design_mat), 1, all))
+      stop(sprintf(
+        "predict_surrogates: non-finite candidate coordinates in row(s): %s",
+        paste(utils::head(bad, 5), collapse = ", ")
+      ), call. = FALSE)
     }
   }
 

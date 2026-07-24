@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 # BATON v0.4.0 helpers for cross-philosophy warmstart and multi-seed verification.
 #
 # Two functions:
@@ -132,7 +129,10 @@ build_initial_history_from_warmstart <- function(warmstart_from,
   # bo_calibrate's initial_history handler accepts: parameter columns +
   # objective + fidelity + feasible. The handler will derive theta, unit_x,
   # theta_id, metrics, variance from these columns.
-  ih <- data.frame(stringsAsFactors = FALSE)
+  # Seed ih with the correct number of rows (an empty data.frame() has 0 rows,
+  # so assigning length-n columns into it throws "replacement has 1 row, data
+  # has 0"). Subsetting ws_df to zero columns preserves its row count.
+  ih <- ws_df[, character(0), drop = FALSE]
   for (p in param_names) {
     ih[[p]] <- as.numeric(ws_df[[p]])
   }
@@ -233,7 +233,10 @@ run_multi_seed_verification <- function(sim_fun,
       per_seed[[i]] <- row
       next
     }
-    metrics_i <- res$metrics
+    # Normalize the simulator return the same way invoke_simulator does: the
+    # documented contract is a named numeric VECTOR (res$metrics errors on that);
+    # a list(metrics=...) variant is also supported.
+    metrics_i <- if (is.list(res) && !is.null(res$metrics)) res$metrics else res
     feasible_i <- tryCatch(
       is_feasible(metrics_i, constraint_tbl),
       error = function(e) NA

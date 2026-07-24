@@ -10,4 +10,13 @@ predict_surrogates(surrogates, unit_x)
 Handles both DiceKriging::km and hetGP::hetGP model objects.
 Optimized for batch prediction with minimal data frame overhead.
 }
+\details{
+`unit_x` is either a numeric matrix (rows = candidates, columns in the
+surrogate's parameter order, or named via `colnames`) or a list of named
+numeric vectors. The matrix path (Task C5) skips the per-candidate
+rebuild entirely and is what the acquisition hot loop uses. Invalid
+candidates are an ERROR on both paths: silently dropping rows would
+misalign the returned predictions with the caller's candidate indices
+(acquisition scores, batch selection).
+}
 \keyword{internal}

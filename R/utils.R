@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Internal helpers for parameter transformations
 #' @keywords internal
 scale_to_unit <- function(theta, bounds) {
@@ -62,7 +59,13 @@ theta_list_to_vec <- function(theta) {
 #' Create deterministic identifier for theta in unit space
 #' @keywords internal
 theta_to_id <- function(unit_theta) {
-  paste(format(round(as.numeric(unit_theta), digits = 6), nsmall = 6), collapse = "|")
+  # formatC(..., format = "f") formats each coordinate independently in fixed
+  # notation. base::format() applies a common style to the whole vector, so a
+  # single tiny coordinate (e.g. a bound at ~1e-7) flips the entire vector to
+  # scientific notation, and the result depends on session options (scipen,
+  # OutDec) - both break duplicate detection at bound edges and across sessions.
+  paste(formatC(round(as.numeric(unit_theta), digits = 6), format = "f", digits = 6),
+        collapse = "|")
 }
 
 #' Enforce integer parameters if requested
@@ -87,9 +90,57 @@ coerce_theta_types <- function(theta, integer_params = NULL) {
 # NOTE: validate_bounds() moved to bounds.R with enhanced error messages
 # and param_names parameter support
 
+#' Require a suggested package at runtime (Task D9)
+#'
+#' Analysis-only dependencies (ggplot2, randtoolbox) live in Suggests so the
+#' calibration core installs without them. Any exported function that needs
+#' one at runtime calls this first, turning a cryptic "there is no package
+#' called ..." into an actionable install hint that names the calling
+#' function.
+#'
+#' @param pkg single package name.
+#' @keywords internal
+require_suggests <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    caller <- sys.call(-1)
+    if (is.null(caller)) {
+      # called from the top level (no caller to name)
+      stop(sprintf(
+        "Package '%s' is required for this function. Install it with install.packages(\"%s\").",
+        pkg, pkg
+      ), call. = FALSE)
+    }
+    stop(sprintf(
+      "Package '%s' is required by %s(). Install it with install.packages(\"%s\").",
+      pkg, paste(deparse(caller[[1]]), collapse = ""), pkg
+    ), call. = FALSE)
+  }
+}
+
 # Null-coalescing helper (internal; not exported, no .Rd generated).
 # Rd's \name{} macro cannot contain |, so we suppress roxygen docs for the
 # infix operator to avoid `checkRd` WARNINGs on R CMD check.
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0) y else x
+}
+
+#' Effective parallel worker count for forked evaluation
+#'
+#' Central decision for how many workers `options(BATON.cores = k)` actually
+#' buys: forking requires Unix and the parallel package, so anywhere else the
+#' effective count is 1 (serial `lapply`). Shared by `evaluate_points()`,
+#' `fit_surrogates()`, and the walltime chunk sizing in `bo_calibrate()` so
+#' the parallel guard and the walltime-check granularity cannot drift apart
+#' (a serial platform gets chunk size 1, i.e. a cap check per evaluation).
+#'
+#' @return A single integer >= 1.
+#' @keywords internal
+effective_cores <- function() {
+  .cores <- as.integer(getOption("BATON.cores", 1L))
+  if (.cores > 1L && .Platform$OS.type == "unix" &&
+      requireNamespace("parallel", quietly = TRUE)) {
+    .cores
+  } else {
+    1L
+  }
 }

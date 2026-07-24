@@ -94,12 +94,17 @@ print(result)
 ## Pattern 1: Sequential Simulator (Most Common)
 
 ```{r}
-my_simulator <- function(theta, fidelity = "high", seed = NULL, ...) {
-  # Determine number of replications
-  n_rep <- switch(fidelity,
-                  low = 200,
-                  med = 1000,
-                  high = 10000)
+my_simulator <- function(theta, fidelity = "high", seed = NULL,
+                         n_rep = NULL, ...) {
+  # BATON passes the exact requested replication count via n_rep. The switch()
+  # is only a fallback for calls made outside BATON; keep it in sync with the
+  # fidelity_levels used in bo_calibrate() (here the package defaults).
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity,
+                    low = 2000,
+                    med = 4000,
+                    high = 10000)
+  }
 
   if (!is.null(seed)) set.seed(seed)
 
@@ -152,8 +157,12 @@ my_parallel_simulator <- function(theta,
                                   fidelity = "high",
                                   n_cores = 4,
                                   seed = NULL,
+                                  n_rep = NULL,
                                   ...) {
-  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
   chunk_size <- ceiling(n_rep / n_cores)
 
   # Set up parallel RNG
@@ -170,8 +179,9 @@ my_parallel_simulator <- function(theta,
     # Each core computes its own mean and variance
     welford_mean_var(
       sample_fn = function(i, theta) {
-        # Your simulation here
-        c(power = ..., EN = ...)
+        # REPLACE with one replicate of YOUR trial; return a named vector,
+        # e.g. c(power = ..., EN = ...)
+        stop("REPLACE: simulate one replicate of your design")
       },
       n_samples = chunk_size,
       theta = theta
@@ -194,8 +204,11 @@ my_parallel_simulator <- function(theta,
 For maximum control, implement Welford directly:
 
 ```{r}
-my_manual_simulator <- function(theta, fidelity = "high", ...) {
-  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+my_manual_simulator <- function(theta, fidelity = "high", n_rep = NULL, ...) {
+  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
 
   # Initialize Welford accumulators
   n_metrics <- 3
@@ -303,12 +316,14 @@ This works, but is **30-50% less efficient** than providing proper variance!
 cat("Memory usage comparison:\n")
 cat("Traditional (store all):", 8 * 10000 * 4, "bytes =", 8 * 10000 * 4 / 1024, "KB\n")
 cat("Welford (incremental): ", 8 * 2 * 4, "bytes\n")
-cat("Reduction factor:      ", (8 * 10000 * 4) / (8 * 2 * 4), "x\n\n")
+cat("Reduction factor:      ", (8 * 10000 * 4) / (8 * 2 * 4), "x\n")
+```
 
-# Speed overhead
+```{r speed-benchmark, eval = requireNamespace("microbenchmark", quietly = TRUE)}
+# Speed overhead (requires the suggested package microbenchmark)
 library(microbenchmark)
 
-# Benchmark Welford overhead
+# Benchmark Welford against storing everything, on a trivial sampler
 benchmark <- microbenchmark(
   welford = {
     result <- welford_mean_var(
@@ -327,53 +342,71 @@ benchmark <- microbenchmark(
 print(summary(benchmark)[, c("expr", "mean", "median")])
 ```
 
-**Result**: Welford adds only ~2% overhead while using 5,000× less memory!
+**Reading this honestly**: on this toy the sampler does almost no work (two
+random draws), so the Welford accumulator dominates the runtime and the
+`welford` timing comes out severalfold slower than the vectorized naive
+version. That ratio is an artifact of the trivial sampler, not a property of
+the algorithm. In a real trial simulator, one replicate simulates an entire
+trial (enrollment, interim analyses, posterior computations), which costs
+orders of magnitude more than the accumulator's few arithmetic operations
+per sample. Relative to any simulator worth optimizing, the overhead is
+negligible; what you keep is the 5,000x memory reduction and the variance
+estimates that make the heteroskedastic GP possible.
 
 # Real-World Example
 
-Here's a realistic clinical trial simulator:
+Here's a realistic clinical trial simulator. Two things matter about its
+structure. First, it simulates under **both hypotheses** inside the
+evaluator: power comes from replicates with the assumed true effect
+(`delta`), type I error from replicates with zero effect. Second, the
+parameters BATON searches over are **design knobs only** (sample size and
+the futility rule); the true treatment effect is a fixed assumption, never a
+calibration parameter.
 
 ```{r}
 adaptive_trial_simulator <- function(theta,
                                      fidelity = c("low", "med", "high"),
                                      seed = NULL,
+                                     n_rep = NULL,
                                      ...) {
   fidelity <- match.arg(fidelity)
-  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
 
   if (!is.null(seed)) set.seed(seed)
 
+  delta <- 0.5  # assumed true effect under the alternative (fixed, not searched)
+
+  n_per_arm <- round(theta$n_per_arm)          # design knob
+  fut_p     <- theta$futility_threshold        # design knob
+  n_interim <- max(2L, round(n_per_arm / 2))   # interim at 50% enrollment
+
+  # One replicate under a given true effect: returns reject indicator and N
+  run_one <- function(effect) {
+    control   <- rnorm(n_per_arm, mean = 0, sd = 1)
+    treatment <- rnorm(n_per_arm, mean = effect, sd = 1)
+
+    # Interim analysis: stop for futility if the interim p-value is large
+    interim_p <- t.test(treatment[1:n_interim], control[1:n_interim])$p.value
+    if (interim_p > fut_p) {
+      c(reject = 0, N = 2 * n_interim)
+    } else {
+      final_p <- t.test(treatment, control)$p.value
+      c(reject = as.numeric(final_p < 0.025), N = 2 * n_per_arm)
+    }
+  }
+
   result <- welford_mean_var(
     sample_fn = function(i, theta) {
-      # Simulate adaptive two-arm trial
-      n_per_arm <- 50
-      control <- rnorm(n_per_arm, mean = 0, sd = 1)
-      treatment <- rnorm(n_per_arm, mean = theta$treatment_effect, sd = 1)
-
-      # Interim analysis
-      interim_p <- t.test(treatment[1:20], control[1:20])$p.value
-      stop_early <- interim_p < theta$futility_threshold
-
-      if (stop_early) {
-        total_n <- 40  # Stopped early
-        reject <- FALSE
-      } else {
-        total_n <- 100  # Continued to full sample
-        final_p <- t.test(treatment, control)$p.value
-        reject <- final_p < 0.025
-      }
-
-      # Calculate duration (months)
-      enrollment_rate <- 5  # patients per month
-      duration <- total_n / enrollment_rate
-
-      c(
-        power = as.numeric(reject),
-        type1 = 0,  # Under H0 scenario
-        EN = total_n,
-        ET = duration,
-        early_stop_rate = as.numeric(stop_early)
-      )
+      alt  <- run_one(delta)  # alternative: power and E[N]
+      null <- run_one(0)      # null: type I error
+      # EN here is expected N under the alternative; use null["N"] instead to
+      # minimize E[N] under the null (a design decision, see the README)
+      c(power = unname(alt["reject"]),
+        type1 = unname(null["reject"]),
+        EN    = unname(alt["N"]))
     },
     n_samples = n_rep,
     theta = theta
@@ -386,21 +419,32 @@ adaptive_trial_simulator <- function(theta,
   return(metrics)
 }
 
-# Run calibration with this simulator
+# Quick check at low fidelity
+check <- adaptive_trial_simulator(
+  theta = list(n_per_arm = 50, futility_threshold = 0.5),
+  fidelity = "low",
+  seed = 42,
+  n_rep = 500  # small direct call for display; BATON would pass fidelity_levels
+)
+print(check)
+```
+
+```{r eval=FALSE}
+# Calibrate the design knobs (not evaluated at build time: slow)
 bounds <- list(
-  treatment_effect = c(0.3, 0.8),
-  futility_threshold = c(0.1, 0.5)
+  n_per_arm = c(30, 100),
+  futility_threshold = c(0.2, 0.8)
 )
 
-# Note: Commented out to avoid long vignette build time
-# fit <- bo_calibrate(
-#   sim_fun = adaptive_trial_simulator,
-#   bounds = bounds,
-#   objective = "EN",
-#   constraints = list(power = c("ge", 0.8)),
-#   n_init = 10,
-#   budget = 30
-# )
+fit <- bo_calibrate(
+  sim_fun = adaptive_trial_simulator,
+  bounds = bounds,
+  objective = "EN",
+  constraints = list(power = c("ge", 0.8), type1 = c("le", 0.10)),
+  integer_params = "n_per_arm",
+  n_init = 10,
+  budget = 30
+)
 ```
 
 # Troubleshooting
@@ -452,32 +496,41 @@ stopifnot(all(c("mean", "variance", "n") %in% names(chunk)))
 
 ## Key Takeaways
 
-✅ **Use `welford_mean_var()` in your simulators**
-- Memory: 64 bytes vs 320 KB (5,000× reduction)
-- Speed: ~2% overhead
+**Use `welford_mean_var()` in your simulators**
+- Memory: 64 bytes vs 320 KB (5,000x reduction)
+- Speed: negligible overhead relative to any real simulator (the accumulator
+  costs a few arithmetic operations per replicate; only on a trivial toy
+  sampler is it visible, as the benchmark above shows)
 - BO Performance: 30-50% improvement
 
-✅ **Use `pool_welford_results()` for parallel simulations**
+**Use `pool_welford_results()` for parallel simulations**
 - Correctly combines statistics from independent workers
 - Accounts for both within and between-chunk variance
 
-✅ **Always attach variance to your metrics**
+**Always attach variance to your metrics**
 ```{r eval=FALSE}
 attr(metrics, "variance") <- result$variance
 ```
 
 ## Quick Reference
 
+This skeleton matches the README's "Minimal Template" section, which also
+shows the surrounding `bo_calibrate()` call.
+
 ```{r eval=FALSE}
 # Basic template
-my_sim <- function(theta, fidelity = "high", seed = NULL, ...) {
-  n_rep <- switch(fidelity, low = 200, med = 1000, high = 10000)
+my_sim <- function(theta, fidelity = "high", seed = NULL, n_rep = NULL, ...) {
+  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
   if (!is.null(seed)) set.seed(seed)
 
   result <- welford_mean_var(
     sample_fn = function(i, theta) {
-      # YOUR SIMULATION HERE
-      c(metric1 = ..., metric2 = ...)
+      # REPLACE with one replicate of YOUR design; return named metrics,
+      # e.g. c(power = ..., type1 = ..., EN = ...)
+      stop("REPLACE: simulate one replicate of your design")
     },
     n_samples = n_rep,
     theta = theta

@@ -1,6 +1,3 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Multi-fidelity ablation study for Bayesian optimisation
 #'
 #' Runs the calibration routine under several fidelity policies to quantify
@@ -8,13 +5,18 @@
 #'
 #' @inheritParams benchmark_methods
 #' @param policies named list mapping policy name to a named numeric vector of
-#'   fidelity levels (passed to the `fidelity_levels` argument of
-#'   [bo_calibrate()]).
+#'   fidelity levels. Names must be a subset of `low`, `med`, `high`. Partial
+#'   policies are normalized onto the full low/med/high contract expected by
+#'   [bo_calibrate()]: each missing level inherits the nearest provided level
+#'   at or below it (else the smallest provided). So `c(low = 500)` simulates
+#'   500 replications regardless of which fidelity the optimizer nominally
+#'   selects, and `c(low = 200, high = 1000)` treats a `med` selection as
+#'   another `low`-cost evaluation.
 #' @param seeds integer vector of seeds used for each replicate.
 #'
 #' @return Object of class `BATON_multifidelity` containing `runs` (per-policy
 #'   records) and `summary` (policy-level averages).
-#' @importFrom rlang .data
+#' @importFrom dplyr .data
 #' @export
 ablation_multifidelity <- function(sim_fun,
                                    bounds,
@@ -33,13 +35,19 @@ ablation_multifidelity <- function(sim_fun,
   validate_bounds(bounds)
   constraint_tbl <- parse_constraints(constraints)
 
-  runs <- purrr::imap_dfr(policies, function(fidelity_levels, policy_name) {
+  # Base R lapply + bind_rows instead of purrr::imap_dfr/map_dfr (Task D9).
+  # imap_dfr passed each policy's name as the second argument (or the integer
+  # index for an unnamed list); the explicit policy_names vector preserves that.
+  policy_names <- if (is.null(names(policies))) seq_along(policies) else names(policies)
+  runs <- dplyr::bind_rows(lapply(seq_along(policies), function(i) {
+    policy_name <- policy_names[[i]]
+    fidelity_levels <- normalize_fidelity_policy(policies[[i]], policy_name)
     if (progress) {
       message(sprintf("Ablation policy '%s' with fidelity levels: %s",
                       policy_name,
                       paste(names(fidelity_levels), fidelity_levels, sep = "=", collapse = ", ")))
     }
-    purrr::map_dfr(seeds, function(seed) {
+    dplyr::bind_rows(lapply(seeds, function(seed) {
       args <- modify_list(list(
         sim_fun = sim_fun,
         bounds = bounds,
@@ -62,8 +70,8 @@ ablation_multifidelity <- function(sim_fun,
         theta = list(history$theta[[best_idx]]),
         total_sim_calls = sum(history$n_rep, na.rm = TRUE)
       )
-    })
-  })
+    }))
+  }))
 
   summary_tbl <- runs |>
     dplyr::group_by(.data$policy) |>
@@ -87,11 +95,45 @@ ablation_multifidelity <- function(sim_fun,
   )
 }
 
+#' Normalize a partial fidelity policy onto the full low/med/high contract
+#'
+#' `bo_calibrate()` requires `fidelity_levels` named exactly low/med/high
+#' (a misnamed level would otherwise surface as a confusing subscript error
+#' deep in fidelity selection). Ablation policies legitimately want fewer
+#' levels ("always 500 reps"), so each missing level inherits the nearest
+#' provided level at or below it (else the smallest provided): the optimizer
+#' can nominally select any fidelity, but never spends more than the policy
+#' authorized beneath that level.
+#'
+#' @keywords internal
+normalize_fidelity_policy <- function(levels, policy_name) {
+  nm <- names(levels)
+  if (is.null(nm) || any(!nzchar(nm)) || !all(nm %in% c("low", "med", "high"))) {
+    stop(sprintf(
+      paste0("Ablation policy '%s': fidelity levels must be named with a ",
+             "subset of 'low', 'med', 'high'; got: %s."),
+      policy_name,
+      if (is.null(nm)) "<unnamed>" else paste(nm, collapse = ", ")
+    ), call. = FALSE)
+  }
+  if (anyDuplicated(nm) > 0) {
+    stop(sprintf("Ablation policy '%s': duplicate fidelity level names.",
+                 policy_name), call. = FALSE)
+  }
+  pick <- function(prefs) {
+    for (p in prefs) if (p %in% nm) return(as.numeric(levels[[p]]))
+  }
+  c(low = pick(c("low", "med", "high")),
+    med = pick(c("med", "low", "high")),
+    high = pick(c("high", "med", "low")))
+}
+
 #' Visualise multi-fidelity budget vs accuracy trade-offs
 #' @param ablation object returned by [ablation_multifidelity()].
 #' @return ggplot object.
 #' @export
 plot_multifidelity_tradeoff <- function(ablation) {
+  require_suggests("ggplot2")
   stopifnot(inherits(ablation, "BATON_multifidelity"))
   ggplot2::ggplot(ablation$summary, ggplot2::aes(x = .data$sim_calls_mean, y = .data$objective_mean, colour = .data$policy)) +
     ggplot2::geom_point(size = 3) +

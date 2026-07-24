@@ -32,18 +32,33 @@ bo_calibrate(
   multi_seed_n = 5L,
   multi_seed_reps = NULL,
   multi_seed_strict = TRUE,
+  max_walltime_s = NULL,
+  callback = NULL,
+  checkpoint_fun = NULL,
+  checkpoint_every = 5L,
+  on_error = c("stop", "return_partial"),
+  slim = FALSE,
   ...
 )
 }
 \arguments{
 \item{sim_fun}{callback with signature
-`function(theta, fidelity = c("low","med","high"), ...)` returning a named
-numeric vector of operating characteristics (e.g., `power`, `type1`, `EN`,
-`ET`). The function should attach attributes `variance` (named numeric
-vector of Monte Carlo variances) and `n_rep` (number of simulator
-replications) for best results. If `variance` is not provided, a binomial
-approximation is used for metrics in [0,1], and a small nugget is used for
-other metrics.}
+  `function(theta, fidelity = c("low","med","high"), ...)` returning a named
+  numeric vector of operating characteristics (e.g., `power`, `type1`, `EN`,
+  `ET`). The function should attach attributes `variance` (named numeric
+  vector of Monte Carlo variances) and `n_rep` (number of simulator
+  replications) for best results. If `variance` is not provided, a binomial
+  approximation is used for metrics in [0,1], and a small nugget is used for
+  other metrics.
+
+  Optionally, the simulator may declare an explicit `n_rep` argument. When
+  it does, BATON passes the requested replication count
+  `n_rep = fidelity_levels[[fidelity]]` (including dynamically escalated
+  values under `fidelity_method = "hybrid_staged"`), so the simulator can
+  honor the exact budget rather than re-deriving it from the fidelity
+  label. Accepting `...` alone does NOT opt in (this keeps wrappers that
+  forward `...` to legacy simulators working); simulators without an
+  `n_rep` formal are called exactly as before (backward compatible).}
 
 \item{bounds}{named list of length-two numeric vectors specifying lower and
 upper limits for each design parameter.}
@@ -63,16 +78,39 @@ applied via local penalization (v0.3.0) to ensure spatially diverse points.}
 \item{budget}{total number of simulator evaluations (initial + BO iterations).
 Default 300 (increased from 150 for tight constraint spaces).}
 
-\item{seed}{base RNG seed for reproducibility.}
+\item{seed}{base RNG seed for reproducibility. With an explicit seed the
+caller's RNG stream is restored on exit (success or error), so calling
+`bo_calibrate()` never advances `.Random.seed` in the calling
+environment. With `seed = NULL` the run seed is drawn from the caller's
+stream via a single `sample.int(1e6, 1)` draw that legitimately advances
+the stream by exactly one step (everything else is still rewound), so
+repeated `seed = NULL` calls give independent replicates. The seed
+actually used is recorded in `fit$policies$seed`.}
 
-\item{initial_history}{optional data frame of previous evaluations to use as
-initialization instead of random Latin hypercube sampling. If provided,
-\code{n_init} is ignored and the BO loop starts immediately with this data.
-Must contain columns for all parameters in \code{bounds}, plus \code{objective},
-\code{fidelity}, \code{feasible}, and individual constraint metric columns.
-All rows must be within the specified \code{bounds}. This enables multi-stage
-warm-starting where later stages reuse evaluations from previous stages with
-narrowed bounds. Default: NULL (use random initialization).}
+\item{initial_history}{optional data frame of previous evaluations to seed
+the initial design. Must contain columns for all parameters in
+\code{bounds}, plus \code{objective}, \code{fidelity}, \code{feasible},
+and individual constraint metric columns. All rows must be within the
+specified \code{bounds}. The provided rows AUGMENT the
+Latin hypercube initial design: if fewer than \code{n_init} rows are
+supplied, fresh LHS points (deduplicated against the provided
+\code{theta_id}s) top up the design to \code{n_init} before the BO loop
+starts, so a handful of donor seeds no longer replaces the whole initial
+design. With \code{n_init} or more rows, no LHS points are added and the
+BO loop starts immediately with this data (multi-stage warm-starting
+where later stages reuse evaluations from previous stages with narrowed
+bounds). Default: NULL (LHS-only initialization).}
+
+\item{warmstart_from}{optional list of calibrated designs to inject as Stage 0
+seeds alongside the LHS sample. Each element should be either a one-row
+data frame with parameter columns matching `names(bounds)` (typical for
+cross-philosophy warmstart from a previous calibration's best design), a
+path to a `*_best_design.csv` file produced by a prior calibration, or a
+list with element `theta` (a named list/vector of parameter values).
+Designs outside the current bounds are filtered with a warning. Default
+`NULL` (LHS-only initial design pool). Internally converted to
+`initial_history`; see the `initial_history` argument of `bo_calibrate`
+for the lower-level API.}
 
 \item{init_stopping}{optional list controlling GP-based initialization early
 stopping. When enabled, a Gaussian process is fit periodically during
@@ -152,8 +190,18 @@ to save budget. Options:
     reset patience counter (default: 1e-3 = 0.1\%)}
   \item{\code{consecutive}}{Integer: number of consecutive patience windows
     showing no improvement required to trigger stop (default: 2)}
+  \item{\code{acq_rel}}{Numeric: acquisition-flatline stop threshold
+    (default: 1e-3). Optimization also stops when the maximum acquisition
+    value of the selected batch stays below a small level for several
+    consecutive iterations. Once a feasible incumbent exists the acquisition
+    is expected constrained improvement (EI * P(feasible)) and the level is
+    \code{acq_rel * |incumbent|}, so the criterion scales with the objective
+    (consistent whether it is O(1) or O(100)); before any feasible point the
+    acquisition is the exploration/expected-violation score and the level is
+    simply \code{acq_rel}.}
 }
-Default: NULL (uses default values: patience=5, threshold=1e-3, consecutive=2).
+Default: NULL (uses default values: patience=5, threshold=1e-3,
+consecutive=2, acq_rel=1e-3).
 Set \code{early_stop = list(enabled = FALSE)} to disable early stopping entirely.}
 
 \item{incumbent_method}{method for computing the incumbent (best feasible) value
@@ -172,50 +220,163 @@ No Regret and the Choice of Incumbent" for theoretical analysis.}
 \item{progress}{logical; if `TRUE` (default) messages are emitted at key
 milestones.}
 
-\item{warmstart_from}{(v0.4.0) optional list of calibrated designs to inject
-as Stage 0 seeds alongside the LHS sample. Each element should be either a
-one-row data frame with parameter columns matching \code{names(bounds)}
-(typical for cross-philosophy warmstart from a previous calibration's best
-design), a path to a \code{*_best_design.csv} file produced by a prior
-calibration, or a list with element \code{theta} (a named list/vector of
-parameter values). Designs outside the current bounds are filtered with a
-warning. Default \code{NULL} (LHS-only initial design pool). Internally
-converted to \code{initial_history}.}
+\item{multi_seed_verify}{logical; if `TRUE`, after Stage 3 selects the
+calibrated design, re-evaluate it at `multi_seed_n` independent seeds at
+`multi_seed_reps` fidelity to detect stored-vs-actual operating-
+characteristic gaps. Default `FALSE` for backward compatibility.}
 
-\item{multi_seed_verify}{(v0.4.0) logical; if \code{TRUE}, after Stage 3
-selects the calibrated design, re-evaluate it at \code{multi_seed_n}
-independent seeds at \code{multi_seed_reps} fidelity to detect
-stored-vs-actual operating-characteristic gaps. Default \code{FALSE} for
-backward compatibility.}
+\item{multi_seed_n}{integer; number of independent seeds for Stage 4
+multi-seed verification. Used only when `multi_seed_verify = TRUE`.
+Default `5`.}
 
-\item{multi_seed_n}{(v0.4.0) integer; number of independent seeds for Stage
-4 multi-seed verification. Used only when \code{multi_seed_verify = TRUE}.
-Default \code{5}.}
+\item{multi_seed_reps}{integer; replications per seed for Stage 4
+verification. Used only when `multi_seed_verify = TRUE`. Default
+`fidelity_levels[["high"]]`.}
 
-\item{multi_seed_reps}{(v0.4.0) integer; replications per seed for Stage 4
-verification. Used only when \code{multi_seed_verify = TRUE}. Default
-\code{fidelity_levels[["high"]]}.}
+\item{multi_seed_strict}{logical; if `TRUE` and any of the
+`multi_seed_n` seeds produces an infeasible operating characteristic
+(constraint violation), the returned `BATON_fit` is marked with
+`verdict = "MULTI_SEED_FAIL"` and the calibration is flagged as not
+adoption-ready. The fit is still returned for diagnostics; downstream
+code can gate on `fit$multi_seed_summary$strict_feas == 1` before
+adopting the design. Default `TRUE`.}
 
-\item{multi_seed_strict}{(v0.4.0) logical; if \code{TRUE} and any of the
-\code{multi_seed_n} seeds produces an infeasible operating characteristic
-(constraint violation), the returned \code{BATON_fit} is marked with
-\code{verdict = "MULTI_SEED_FAIL"} and the calibration is flagged as not
-adoption-ready. The fit is still returned for diagnostics; downstream code
-can gate on \code{fit$multi_seed_summary$strict_feas == 1} before adopting
-the design. Default \code{TRUE}.}
+\item{max_walltime_s}{optional walltime cap in seconds (default `NULL`, no
+cap). Elapsed time is measured from function entry and checked between
+initial-design evaluation chunks and at the top of each BO iteration, so
+the cap is advisory (chunk/iteration-granular), not preemptive: a running
+chunk or batch is never interrupted, and the run may overshoot the cap by
+up to one chunk or one full iteration (surrogate fit plus `q` simulator
+evaluations). When the cap trips, the function returns normally with a
+partial but internally consistent fit whose `status` field is
+`"walltime"`. If the cap is first crossed on a final chunk or batch that
+simultaneously ends the run for another reason (e.g. the budget is
+exhausted), `status` records that reason instead. In either case, once
+the cap has been reached, Stage 4 multi-seed verification is skipped
+even when `multi_seed_verify = TRUE`.}
+
+\item{callback}{optional function invoked once at the END of each BO
+iteration (after the batch has been evaluated and recorded; it is NOT
+invoked during the initial design phase). It receives a single list with
+fields:
+\describe{
+  \item{\code{iter}}{Current BO iteration number (1-based).}
+  \item{\code{eval_count}}{Total evaluations recorded so far (including
+    the initial design and any donor rows).}
+  \item{\code{best_objective}}{Best feasible objective value known at the
+    start of the iteration (the ECI incumbent), or `NA_real_` if no
+    feasible point exists yet. Under the default incumbent method
+    (`"bpm"`) this may be surrogate-predicted (a GP posterior mean), not
+    necessarily an observed value.}
+  \item{\code{best_observed}}{Best observed feasible objective by row,
+    including the just-completed batch, or `NA_real_` if no feasible
+    point exists yet.}
+  \item{\code{elapsed_s}}{Seconds elapsed since function entry.}
+}
+Contract: return `TRUE` to continue; any other return value cancels the
+run cooperatively AFTER the current iteration (no mid-batch interruption,
+no completed work discarded) and the returned fit has `status`
+`"cancelled"`. A logging-only callback must therefore return `TRUE` as
+its final expression (e.g. call `message(info$iter)` and then `TRUE`).
+An error raised by
+the callback produces a warning and the
+run continues (a monitoring hook must not kill a paid run). A cancelled
+run skips Stage 4 multi-seed verification even when
+`multi_seed_verify = TRUE`. If the callback cancels on the final
+iteration (one that simultaneously ends the run because the budget is
+exhausted), `status` records `"cancelled"` rather than
+`"budget_exhausted"`, and Stage 4 verification is skipped. Default
+`NULL` (no callback).}
+
+\item{checkpoint_fun}{optional function invoked with a slim, resumable
+`BATON_fit` snapshot (`status = "checkpoint"`) every `checkpoint_every`
+completed BO iterations (iteration-granular, not per-evaluation; the
+initial design phase emits no checkpoints). Snapshots carry the full
+evaluation `history`, the observed feasible best so far (`best_theta`
+is `NULL` and `best_objective` is `NA_real_` before feasibility), and
+the run's `policies`, but `surrogates` and `diagnostics` are `NULL`:
+GP objects are large, environment-laden, and not needed to resume. To
+resume from a saved checkpoint `ckpt`, pass its history back in:
+`bo_calibrate(..., initial_history = ckpt$history,
+n_init = nrow(ckpt$history))`; keeping `n_init <= nrow(ckpt$history)`
+avoids the donor-augmentation LHS top-up (Task B2 rule), so the resume
+refits surrogates from the recorded history and continues the run. The
+return value of `checkpoint_fun` is ignored; an error it raises
+produces a warning and the run continues (same rationale as
+`callback`). Default `NULL` (no checkpoints).}
+
+\item{checkpoint_every}{single positive integer; number of completed BO
+iterations between checkpoint snapshots. Used only when
+`checkpoint_fun` is supplied. Default `5L`.}
+
+\item{on_error}{one of `"stop"` (default) or `"return_partial"`. With
+`"stop"`, any error raised during the run (simulator failure, surrogate
+fitting failure, ...) propagates to the caller exactly as before. With
+`"return_partial"`, an error inside an evaluation round or BO iteration
+ends the run gracefully instead: the function returns a partial but
+internally consistent `BATON_fit` with `status = "errored"` and the
+condition message in `error_message`, preserving every completed
+evaluation. Granularity caveat: history rows are appended once per
+evaluation round (an initial-design chunk or a BO batch), so a failure
+inside a round loses that round's evaluations, including any that
+completed before the failing one (with parallel evaluation via
+`options(BATON.cores)`, the whole failed batch); rows from all PRIOR
+rounds always survive. Without a walltime cap the whole LHS initial
+design is a single round, so an error there yields an empty-history
+partial fit. After an in-loop error the final surrogate refit is still
+attempted (in its own guard), so `surrogates` may be `NULL` in the
+partial fit; Stage 4 multi-seed verification is skipped. A failure
+INSIDE Stage 4 verification itself (one that escapes
+`run_multi_seed_verification`'s per-seed catch) is also guarded:
+the fit is returned with `status = "errored"`,
+`multi_seed_summary`/`multi_seed_runs` `NULL`, and `verdict` `NA`.
+Likewise a post-refit `generate_diagnostics` failure drops
+`diagnostics` (with a warning) instead of losing the fit. Interrupts
+(Ctrl-C) are never caught in either mode.}
+
+\item{slim}{logical; if `TRUE` the returned `BATON_fit` is a lightweight
+decision object: `surrogates`, `diagnostics`, and `multi_seed_runs` are
+`NULL`, while `history`, `best_theta`, `best_objective`, `policies`,
+`multi_seed_summary`, `verdict`, `status`, and `error_message` are kept
+(the adoption gate survives). Rationale: km/hetGP surrogate objects
+carry closures and environments that inflate `saveRDS` payloads far
+beyond the decision content, so a calibration service persisting many
+fits wants `slim`. Because nothing else consumes the post-loop
+surrogate refit (`best_theta`/`best_objective` are computed from the
+history alone), `slim = TRUE` also SKIPS that final refit entirely,
+saving one full GP fit per run; a side effect is that an error arising
+only in the final refit cannot surface under `slim = TRUE` (the run
+returns its natural status). Downstream helpers that need the fitted
+surrogates (`sa_sobol()`, `sensitivity_diagnostics()`,
+`extract_case_study()`) require a non-slim fit. A slim fit remains
+resumable via `initial_history = fit$history`. Default `FALSE`.}
 
 \item{...}{additional arguments forwarded to `sim_fun`.}
 }
 \value{
 An object of class `BATON_fit` containing the optimisation history,
   best design, fitted surrogates, policy configuration, and posterior draws
-  supporting sensitivity diagnostics. When \code{multi_seed_verify = TRUE},
-  also includes \code{multi_seed_summary} (per-seed evaluations + summary
-  statistics) and \code{verdict} (\code{"MULTI_SEED_PASS"} or
-  \code{"MULTI_SEED_FAIL"}). Note: early stopping may terminate before
-  \code{budget} is exhausted if convergence is detected (configurable via
-  \code{early_stop} parameter, default: no improvement > 0.1\% for 5
-  iterations).
+  supporting sensitivity diagnostics. With `slim = TRUE` the `surrogates`,
+  `diagnostics`, and `multi_seed_runs` components are `NULL` (see the
+  `slim` argument). When `multi_seed_verify = TRUE`, also
+  includes `multi_seed_summary` (summary statistics), `multi_seed_runs`
+  (the per-seed evaluations; `NULL` under `slim = TRUE`), and `verdict`
+  (`"MULTI_SEED_PASS"`, `"MULTI_SEED_FAIL"` when the strict gate fails
+  under `multi_seed_strict = TRUE`, or `"MULTI_SEED_WARN"` when it fails
+  under `multi_seed_strict = FALSE`), unless the
+  `max_walltime_s` cap tripped or the run was cancelled via `callback`, in
+  which case Stage 4 verification is
+  skipped and `multi_seed_summary` is `NULL` with `verdict` `NA`. Note: early
+  stopping may terminate before \code{budget} is exhausted if convergence
+  is detected (configurable via \code{early_stop} parameter, default: no
+  improvement > 0.1\% for 5 iterations). The `status` field records why
+  the run ended: `"budget_exhausted"` (evaluation budget consumed),
+  `"early_stopped"` (improvement plateau), `"acq_flatline"`
+  (acquisition values below the \code{acq_rel} threshold),
+  `"walltime"` (the \code{max_walltime_s} cap tripped between iterations),
+  `"cancelled"` (the \code{callback} requested cancellation at the end
+  of a BO iteration), or `"errored"` (an error was caught under
+  \code{on_error = "return_partial"}; the message is in `error_message`).
 }
 \description{
 Implements the methodology described in Section 2 of the manuscript:

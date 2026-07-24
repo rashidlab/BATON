@@ -18,66 +18,67 @@ bo_calibrate_philosophies(
 )
 }
 \arguments{
-\item{scenario_id}{Character; identifier for the scenario being calibrated.
-Used in messages and the returned manifest.}
+\item{scenario_id}{Character; identifier for the scenario being
+calibrated. Used in messages and the returned manifest.}
 
-\item{sim_fun}{Simulator function (same as \code{\link{bo_calibrate}}).}
+\item{sim_fun}{Simulator function (same as `bo_calibrate()`).}
 
-\item{bounds}{Named list of length-2 numeric vectors defining the search box.
-Same for all philosophies in the batch.}
+\item{bounds}{Named list of length-2 numeric vectors defining the search
+box. Same for all philosophies in the batch.}
 
-\item{philosophies}{Named list, one element per philosophy, each containing
-\code{objective} and \code{constraints} fields (the philosophy-specific
+\item{philosophies}{Named list, one element per philosophy, each
+containing `objective` and `constraints` fields (the philosophy-specific
 calibration target). Order does NOT need to be dependency order; the
-wrapper sorts internally. Each \code{objective} (and every constraint name)
-must be the name of a metric that \code{sim_fun} returns; there is no built-in
+wrapper sorts internally. Each `objective` (and every constraint name)
+must be the name of a metric that `sim_fun` returns; there is no built-in
 weighted-loss objective, so compute the weighted loss (e.g.
-\code{weighted_EN_N}) inside the simulator and return it as a named metric.}
+`weighted_EN_N`) inside the simulator and return it as a named metric.}
 
 \item{dependency_order}{Optional character vector specifying which
 philosophies are donors (calibrated first, no warmstart) and which are
 recipients (calibrated second, warmstart from all preceding successful
 calibrations). Default: donors are
-\code{c("Fleming", "Minimax", "Admissible")} and recipients are
-\code{c("Optimal", "Alt-Optimal")} (and any others not in donors); within
-each group, the order of \code{philosophies} is preserved.}
+`c("Fleming", "Minimax", "Admissible")` and recipients are
+`c("Optimal", "Alt-Optimal")` (and any others not in donors); within
+each group, the order of `philosophies` is preserved.}
 
-\item{multi_seed_verify}{Logical; pass to \code{bo_calibrate()}. Default
-\code{TRUE} (more conservative than \code{bo_calibrate()}'s default; the
-whole point of this wrapper is the verification gate).}
+\item{multi_seed_verify}{Logical; pass to `bo_calibrate()`. Default `TRUE`
+(more conservative than `bo_calibrate()`'s default; the whole point of
+this wrapper is the verification gate).}
 
 \item{multi_seed_n}{Integer; number of seeds for Stage 4 verification.
 Default 5.}
 
-\item{multi_seed_strict}{Logical; if \code{TRUE}, recipient philosophies are
+\item{multi_seed_strict}{Logical; if TRUE, recipient philosophies are
 warmstarted only from donors that passed multi-seed verification. If a
-recipient's warmstart pool is empty (all donors failed multi-seed), the
-recipient is calibrated with LHS-only Stage 0 and a warning is emitted.
-Default \code{TRUE}.}
+recipient's warmstart pool is empty (all donors failed multi-seed),
+the recipient is calibrated with LHS-only Stage 0 and a warning is
+emitted. Default TRUE.}
 
-\item{...}{Additional arguments forwarded to every \code{bo_calibrate()}
-call (e.g., \code{n_init}, \code{budget}, \code{seed},
-\code{fidelity_levels}).}
+\item{...}{Additional arguments forwarded to every `bo_calibrate()` call
+(e.g., `n_init`, `budget`, `seed`, `fidelity_levels`).}
 }
 \value{
-A list with class \code{BATON_batch_fit} and elements:
+A list with class `BATON_batch_fit` and elements:
   \itemize{
     \item \code{scenario_id}: as supplied
-    \item \code{fits}: named list of \code{BATON_fit} objects, one per
-      philosophy
+    \item \code{fits}: named list of `BATON_fit` objects, one per philosophy.
+      A philosophy whose calibration errors is not fatal to the batch: its
+      entry is an errored fit with `status = "errored"`, `error_message`
+      (the message; `error` is kept as a back-compat alias),
+      `best_theta = NULL`, and an empty `history` tibble.
     \item \code{manifest}: data frame with columns
-      \code{philosophy}, \code{dependency_role} ("donor" or "recipient"),
-      \code{verdict} (\code{"MULTI_SEED_PASS"} / \code{"MULTI_SEED_FAIL"} /
-      \code{"MULTI_SEED_WARN"} / \code{NA_character_}),
-      \code{n_max}, \code{objective_value},
-      \code{warmstart_donors} (semi-colon-separated names),
-      \code{runtime_s}
+      `philosophy`, `dependency_role` ("donor" or "recipient"), `verdict`
+      (`"MULTI_SEED_PASS"` / `"MULTI_SEED_FAIL"` / `"MULTI_SEED_WARN"` /
+      `"ERRORED"` for a failed calibration / `NA_character_`), `n_max`,
+      `objective_value`, `warmstart_donors` (semi-colon-separated names),
+      runtime_s
   }
 }
 \description{
-This is a batch-level wrapper around \code{\link{bo_calibrate}} for the
-common workflow of calibrating multiple design philosophies (Optimal,
-Minimax, Fleming, Admissible, Alt-Optimal) for a single scenario. It runs
+This is a batch-level wrapper around `bo_calibrate()` for the common
+workflow of calibrating multiple design philosophies (Optimal, Minimax,
+Fleming, Admissible, Alt-Optimal) for a single scenario. It runs
 philosophies in a dependency-aware order (the "donor" philosophies are
 calibrated first, then "recipient" philosophies are calibrated with
 warmstart from the donors' calibrated designs as Stage 0 seeds), and
@@ -85,45 +86,19 @@ invokes Stage 4 multi-seed verification on every calibrated design.
 }
 \details{
 This pipeline addresses two failure modes documented in the BATON
-bounds-widening campaign (May 2026; see the JASA manuscript Web Appendix
-G.5 for the full empirical record):
+bounds-widening campaign (see `inst/doc/bounds_widening_findings.md` if
+included, or the JASA manuscript Web Appendix G.5):
 
 \enumerate{
   \item \strong{BO local minima in high-dimensional spaces} — donor
     philosophies' calibrated points seed the surrogate's initial belief,
     helping it escape local minima that an LHS-only Stage 0 might miss.
     Demonstrated by the resolution of the multi-arm Optimal vs Fleming
-    Pareto inversion: original W3 Optimal calibrated at
-    \eqn{E_0[N] = 67.19}; Fleming-warmstarted Optimal calibrated at
-    \eqn{E_0[N] = 65.66}, strictly better than both the original and
-    Fleming under Optimal's own loss.
+    Pareto inversion.
   \item \strong{Stored-vs-actual operating-characteristic gaps} —
     calibration-time low-fidelity validation tier values can land
-    favorably while the seed-averaged high-fidelity multi-seed value is
-    far from the regulatory boundary. Demonstrated by SYMM H1 with
+    favorably while the seed-averaged high-fidelity multi-seed value
+    is far from the regulatory boundary. Demonstrated by SYMM H1 with
     stored type-I < 0.10 but multi-seed type-I = 0.165.
-}
-}
-\examples{
-\dontrun{
-batch <- bo_calibrate_philosophies(
-  scenario_id = "cohortA_strong_effect",
-  sim_fun = your_simulator,
-  bounds = your_bounds,
-  philosophies = list(
-    Fleming = list(objective = "weighted_EN_N",
-                    constraints = list(power = c("ge", 0.80),
-                                       type1 = c("le", 0.10))),
-    Minimax = list(objective = "total_n",
-                    constraints = list(power = c("ge", 0.80),
-                                       type1 = c("le", 0.10))),
-    Optimal = list(objective = "EN_null",
-                    constraints = list(power = c("ge", 0.80),
-                                       type1 = c("le", 0.10)))
-  ),
-  budget = 300
-)
-batch$manifest
-batch$fits$Optimal$verdict
 }
 }

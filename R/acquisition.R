@@ -1,9 +1,7 @@
-# Copyright (c) 2026. For not-for-profit research and educational use only; all
-# other rights reserved. See the LICENSE file for full terms.
-
 #' Expected constrained improvement acquisition function
 #'
-#' @param unit_x list of candidate points on the unit hypercube.
+#' @param unit_x candidate points on the unit hypercube: a numeric matrix
+#'   (rows = candidates, named columns) or a list of named numeric vectors.
 #' @param surrogates named list of fitted surrogate models (as returned by [fit_surrogates()]).
 #' @param constraint_tbl tibble from [parse_constraints()].
 #' @param objective name of the objective metric (character scalar).
@@ -140,24 +138,21 @@ compute_expected_violation <- function(pred, constraint_tbl, metric_names) {
     mu_vec <- pred[[metric]]$mean
     sd_vec <- pred[[metric]]$sd + 1e-10  # Add epsilon once
 
+    # Expected violation magnitude E[max(0, gap)] for a Gaussian predictive
+    # distribution is sd * (z * Phi(z) + phi(z)), where z is the standardized
+    # signed distance into the infeasible region. This grows without bound as a
+    # point becomes more infeasible and decays to 0 well inside the feasible
+    # region - the property needed to steer search toward the boundary. (The
+    # previous code reduced to sd * phi(z), which peaks AT the boundary and
+    # vanishes for deeply infeasible points.)
     if (direction == "ge") {
-      # Constraint: metric >= threshold
-      # Violation when metric < threshold
+      # Constraint: metric >= threshold; violation when metric < threshold
       z <- (threshold - mu_vec) / sd_vec
-      prob_violate <- stats::pnorm(z)
-      # Expected shortfall (expected violation magnitude)
-      expected_shortfall <- sd_vec * stats::dnorm(z) / (prob_violate + 1e-10)
-      violations <- violations + prob_violate * expected_shortfall
-
     } else {  # "le"
-      # Constraint: metric <= threshold
-      # Violation when metric > threshold
+      # Constraint: metric <= threshold; violation when metric > threshold
       z <- (mu_vec - threshold) / sd_vec
-      prob_violate <- stats::pnorm(z)
-      # Expected excess (expected violation magnitude)
-      expected_excess <- sd_vec * stats::dnorm(z) / (prob_violate + 1e-10)
-      violations <- violations + prob_violate * expected_excess
     }
+    violations <- violations + sd_vec * (z * stats::pnorm(z) + stats::dnorm(z))
   }
 
   violations
@@ -190,11 +185,16 @@ select_batch_local_penalization <- function(candidates, acq_scores, q,
 
   selected_indices <- integer(q)
   penalized_scores <- acq_scores
-  # OPTIMIZED: Pre-allocate matrix instead of do.call(rbind, ...)
-  n_dims <- length(candidates[[1]])
-  candidates_matrix <- matrix(NA_real_, nrow = n_candidates, ncol = n_dims)
-  for (i in seq_len(n_candidates)) {
-    candidates_matrix[i, ] <- as.numeric(candidates[[i]])
+  # Task C5: the candidate pool arrives as a matrix; keep the list path for
+  # back-compat with direct callers.
+  if (is.matrix(candidates)) {
+    candidates_matrix <- candidates
+  } else {
+    n_dims <- length(candidates[[1]])
+    candidates_matrix <- matrix(NA_real_, nrow = n_candidates, ncol = n_dims)
+    for (i in seq_len(n_candidates)) {
+      candidates_matrix[i, ] <- as.numeric(candidates[[i]])
+    }
   }
 
   for (i in seq_len(q)) {
@@ -209,10 +209,13 @@ select_batch_local_penalization <- function(candidates, acq_scores, q,
       # Compute distances to selected point
       distances <- compute_distances(candidates_matrix, selected_point)
 
-      # Penalization function: max(0, L * r - acq_best)
-      # where r is distance, L is Lipschitz constant
-      # Points within distance acq_best/L of selected point get penalized
-      penalty <- pmax(0, lipschitz * distances - penalized_scores[best_idx])
+      # Penalization function (Gonzalez et al. 2016): max(0, acq_best - L * r)
+      # where r is distance and L is the Lipschitz constant. The penalty is
+      # LARGEST at the selected point (r = 0) and decays to 0 at radius
+      # acq_best / L, so candidates NEAR an already-selected design are
+      # suppressed and the batch spreads out. (The previous form used
+      # L*r - acq_best, which penalized FAR candidates and clustered the batch.)
+      penalty <- pmax(0, penalized_scores[best_idx] - lipschitz * distances)
 
       # Apply penalty
       penalized_scores <- penalized_scores - penalty

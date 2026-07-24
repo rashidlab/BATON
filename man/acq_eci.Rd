@@ -15,7 +15,8 @@ acq_eci(
 )
 }
 \arguments{
-\item{unit_x}{list of candidate points on the unit hypercube.}
+\item{unit_x}{candidate points on the unit hypercube: a numeric matrix
+(rows = candidates, named columns) or a list of named numeric vectors.}
 
 \item{surrogates}{named list of fitted surrogate models (as returned by [fit_surrogates()]).}
 
