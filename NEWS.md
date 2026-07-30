@@ -1,5 +1,43 @@
 # BATON Changelog
 
+## BATON 0.8.0 (2026-07-30)
+
+Behavior-changing fixes to the fidelity machinery, found while writing the
+methods vignette against the code. The golden-master reference was
+re-baselined once (adaptive escalation) and is otherwise unchanged.
+
+### Fixes
+
+- **The default adaptive fidelity method now actually escalates.** Its value
+  score was fidelity-independent, so the cheapest tier always won and the
+  cost machinery was dead weight. Each level now earns a saturating
+  information gain g = R / (R + R_ref) and is scored net of a cost penalty
+  that grows with iteration and budget depletion: high-uncertainty,
+  near-boundary, high-acquisition proposals escalate; weak proposals stay
+  cheap; late-run picks favor the medium tier. Golden-master trajectory
+  re-baselined accordingly.
+- **Candidate-pool late inflation is reachable.** The +50 percent refinement
+  pool triggered on a threshold that ignored the initial design and could
+  never fire under the defaults; it now keys on the realized iteration
+  budget (rounded up for partial final batches).
+- **`fidelity_levels` is canonicalized ascending.** The initial design and
+  every selection-method fallback now use the cheapest tier regardless of
+  the input's name order; previously c(high = ..., low = ...) silently ran
+  the whole initial design at the high count. Dynamic hybrid_staged scaling
+  also pairs each label with its own base value under any labeling.
+
+### Cleanups
+
+- Errored philosophy entries no longer carry the deprecated `error` alias
+  (use `error_message`); the internal legacy status value "completed" is
+  retired; `sa_sobol()` and case-study diagnostics error informatively on
+  slim fits; callback/checkpoint documentation states that user hooks must
+  not modify RNG state.
+- The case-study vignette's precomputed results were regenerated under the
+  new selector (trajectory unchanged on that problem: the low tier already
+  meets its precision needs, and the vignette now shows the scoring
+  arithmetic behind that decision).
+
 ## BATON 0.7.1 (2026-07-30)
 
 Documentation release; no code changes beyond two small guards shipped

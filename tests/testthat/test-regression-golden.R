@@ -52,23 +52,27 @@ test_that("calibration results are independent of BATON.cores (reproducibility)"
 })
 
 test_that("golden calibration matches the reference snapshot", {
-  # Reference re-baselined after Task A3 (corrected local-penalization sign).
-  # Batch diversity now suppresses near-duplicates instead of clustering, which
-  # improves exploration: the optimum found is slightly BETTER than before
-  # (best_obj 0.02015 vs 0.02051), even closer to the true optimum EN=0.02 at
-  # (0.5, 0.25). q=2 so batch selection is exercised; the initial design (1-6) and
-  # first batch (7-8) are unchanged, divergence begins at index 10 (second batch).
+  # Reference re-baselined for v0.8 defect 1 (adaptive fidelity escalation).
+  # The default adaptive method previously ran everything at low fidelity
+  # (its value score had no fidelity dependence, so the cheapest level always
+  # won); the fixed selector escalates high-value candidates, and this run's
+  # fidelity mix is 13 low / 3 high. The high-fidelity picks carry zero
+  # injected noise in golden_sim_fun (noise = 0.02/0.01/0 by tier), so the
+  # incumbent is now a noise-free measurement: best_obj 0.00500 vs the
+  # all-low-tier 0.02015 of the previous baseline (which included the +0.02
+  # low-tier offset). The initial design (1-9) is unchanged; divergence
+  # begins at index 10, the first escalated evaluation.
   fit <- run_golden()
   expect_equal(length(fit$history$objective), 16L)
-  expect_equal(round(fit$best_objective, 8), 0.02015498, tolerance = 1e-8)
+  expect_equal(round(fit$best_objective, 8), 0.00500346, tolerance = 1e-8)
   expect_equal(round(unlist(fit$best_theta), 5),
-               c(x1 = 0.51146, x2 = 0.25487), tolerance = 1e-5)
+               c(x1 = 0.53432, x2 = 0.18815), tolerance = 1e-5)
   # Full objective-vector fingerprint: the strongest guard against silent drift.
   expect_equal(
     round(fit$history$objective, 6),
     round(c(0.021780, 0.517127, 0.139296, 0.144183, 0.509814, 0.056903,
-            0.256992, 0.252274, 0.021528, 0.052876, 0.020155, 0.020156,
-            0.021364, 0.022188, 0.021300, 0.020513), 6),
+            0.256992, 0.252274, 0.021528, 0.032876, 0.023776, 0.005003,
+            0.080482, 0.052200, 0.021191, 0.020513), 6),
     tolerance = 1e-5
   )
   # Per-evaluation feasibility classification is a core output: guard it so a
@@ -77,5 +81,12 @@ test_that("golden calibration matches the reference snapshot", {
     fit$history$feasible,
     c(TRUE, FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE,
       TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)
+  )
+  # Fidelity routing is the subject of the v0.8 defect-1 fix: pin the mix so
+  # a regression back to all-low (or an escalation blowup) trips this test.
+  expect_equal(
+    fit$history$fidelity,
+    c("low", "low", "low", "low", "low", "low", "low", "low",
+      "low", "high", "low", "high", "low", "high", "low", "low")
   )
 })

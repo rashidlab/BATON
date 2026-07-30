@@ -91,3 +91,29 @@ test_that("sa_sobol identifies the dominant parameter with valid indices", {
   expect_gt(sob$S_first[sob$parameter == "x1"],
             sob$S_first[sob$parameter == "x2"])
 })
+
+test_that("sa_sobol gives a slim-aware error when surrogates are missing (v0.8)", {
+  expect_error(
+    sa_sobol(NULL, c8_bounds, outcome = "EN", n_mc = 400),
+    "Slim fits.*slim = FALSE"
+  )
+  expect_error(
+    sa_sobol(list(), c8_bounds, outcome = "EN", n_mc = 400),
+    "No surrogates in this fit"
+  )
+})
+
+test_that("case_study_diagnostics gives a slim-aware error on a slim fit (v0.8)", {
+  slim_fit <- build_baton_fit(
+    history = initialise_history(),
+    best_theta = NULL, best_objective = NA_real_, surrogates = NULL,
+    policies = NULL, diagnostics = NULL, multi_seed_summary = NULL,
+    multi_seed_runs = NULL, verdict = NA_character_, bounds = NULL,
+    constraints = NULL, constraint_tbl = NULL,
+    status = "budget_exhausted"
+  )
+  expect_error(
+    case_study_diagnostics(slim_fit),
+    "No surrogates in this fit.*slim = FALSE"
+  )
+})

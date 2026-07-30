@@ -199,7 +199,7 @@ batch$manifest
 If one philosophy's calibration errors, the batch continues: that
 philosophy's entry in `batch$fits` is an errored fit with
 `status = "errored"` and the failure message in `error_message` (the
-`error` field is kept as a back-compat alias).
+old `error` alias was removed in v0.8).
 
 ## Backward compatibility
 

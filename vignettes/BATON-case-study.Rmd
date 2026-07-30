@@ -402,16 +402,26 @@ this problem it is also believable, because the four-dimensional space is
 smooth and the surrogates learn it quickly. Budget you did not need is
 budget saved.
 
-Second, every evaluation ran at the low tier. The adaptive fidelity
-selector promotes evaluations when higher replication buys information
-the search actually needs, and on this fast, smooth problem it decided
-low-tier information was sufficient throughout. This is a legitimate
-allocation, but it has a consequence you must not forget: nothing in the
-optimization history has been measured to better than a 0.0035 standard
-error on type I error, so the verification stage is carrying all of the
-high-precision burden. On harder problems, or with `fidelity_costs`
-reflecting a genuinely expensive high tier, you will see mixed
-allocations.
+Second, every evaluation ran at the low tier, for two different reasons.
+The 40 initial-design rows run at the cheapest tier by construction (a
+space-filling design is for coverage, not precision, so BATON never
+scores it). The 20 BO-phase proposals did each go through the adaptive
+selector, which computes a scale-free value score for the proposed point
+(relative expected improvement, objective uncertainty, proximity to the
+feasibility boundary) and weighs each tier's expected information gain
+against its cost; a tier escalates only when the candidate's value
+justifies paying 2x or 5x for sharper information. On this problem the
+case for escalation never materializes: the low tier already estimates
+`EN` to about 1% relative error, so the best candidates carry value
+scores around 0.02 where roughly 0.05 would be needed, and low wins all
+20 scored calls (the closest call is the first BO iteration). You can watch the selector's arithmetic yourself by setting
+`options(BATON.debug_fidelity = TRUE)`, which prints each decision's
+value score and per-tier net values. Expect mixed allocations when
+candidates promise proportionally larger gains or the objective's Monte
+Carlo noise is coarser. The all-low history has a consequence you must
+not forget: nothing in it has been measured to better than a 0.0035
+standard error on type I error, so the verification stage is carrying
+all of the high-precision burden.
 
 Third, `r sum(fit_balanced$history$feasible)` of the evaluations were
 observed-feasible. The feasible region is a thin shell here (the

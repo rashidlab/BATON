@@ -60,6 +60,9 @@ case_study_diagnostics <- function(fit,
                                    gradient_points = 200,
                                    eps = 1e-3) {
   stopifnot(inherits(fit, "BATON_fit"))
+  if (is.null(fit$surrogates) || length(fit$surrogates) == 0) {
+    stop("No surrogates in this fit. Slim fits (slim = TRUE) drop them; re-run with slim = FALSE for sensitivity analysis.", call. = FALSE)
+  }
   bounds <- infer_bounds_from_history(fit$history)
   objective <- fit$policies$objective %||% names(fit$surrogates)[1]
   sobol_tbl <- sa_sobol(fit$surrogates, bounds, outcome = objective, n_mc = sobol_samples)

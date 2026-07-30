@@ -12,6 +12,9 @@ sa_sobol <- function(surrogates,
                      bounds,
                      outcome = "EN",
                      n_mc = 1000) {
+  if (is.null(surrogates) || length(surrogates) == 0) {
+    stop("No surrogates in this fit. Slim fits (slim = TRUE) drop them; re-run with slim = FALSE for sensitivity analysis.", call. = FALSE)
+  }
   if (!outcome %in% names(surrogates)) {
     stop(sprintf("Outcome '%s' not available in surrogates.", outcome), call. = FALSE)
   }

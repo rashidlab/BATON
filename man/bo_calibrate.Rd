@@ -132,7 +132,10 @@ Default: NULL (no early stopping, use full n_init).}
 
 \item{fidelity_levels}{named numeric vector giving the number of simulator
 replications associated with each fidelity level. Default: c(low=2000, med=4000,
-high=10000), increased from (200, 1000, 10000) for reduced Monte Carlo variance.}
+high=10000), increased from (200, 1000, 10000) for reduced Monte Carlo variance.
+The order of the input does not matter: the vector is canonicalized to
+ascending replication count, so the initial design and the selection
+methods' fallback always use the cheapest level.}
 
 \item{fidelity_method}{method for selecting fidelity level. Options:
 \describe{
@@ -285,7 +288,11 @@ run skips Stage 4 multi-seed verification even when
 `multi_seed_verify = TRUE`. If the callback cancels on the final
 iteration (one that simultaneously ends the run because the budget is
 exhausted), `status` records `"cancelled"` rather than
-`"budget_exhausted"`, and Stage 4 verification is skipped. Default
+`"budget_exhausted"`, and Stage 4 verification is skipped. The callback
+must not modify the RNG state (no random draws, no `set.seed()`): the
+optimizer's random-number stream determines the trajectory, so a hook
+wanting randomness should save `.Random.seed` and restore it before
+returning. Default
 `NULL` (no callback).}
 
 \item{checkpoint_fun}{optional function invoked with a slim, resumable
@@ -303,7 +310,10 @@ avoids the donor-augmentation LHS top-up (Task B2 rule), so the resume
 refits surrogates from the recorded history and continues the run. The
 return value of `checkpoint_fun` is ignored; an error it raises
 produces a warning and the run continues (same rationale as
-`callback`). Default `NULL` (no checkpoints).}
+`callback`). Like `callback`, `checkpoint_fun` must not modify the RNG
+state (no random draws, no `set.seed()`); a hook wanting randomness
+should save `.Random.seed` and restore it before returning. Default
+`NULL` (no checkpoints).}
 
 \item{checkpoint_every}{single positive integer; number of completed BO
 iterations between checkpoint snapshots. Used only when

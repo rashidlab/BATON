@@ -67,7 +67,7 @@
 #'     \item \code{fits}: named list of `BATON_fit` objects, one per philosophy.
 #'       A philosophy whose calibration errors is not fatal to the batch: its
 #'       entry is an errored fit with `status = "errored"`, `error_message`
-#'       (the message; `error` is kept as a back-compat alias),
+#'       (the condition message),
 #'       `best_theta = NULL`, and an empty `history` tibble.
 #'     \item \code{manifest}: data frame with columns
 #'       `philosophy`, `dependency_role` ("donor" or "recipient"), `verdict`
@@ -160,8 +160,6 @@ bo_calibrate_philosophies <- function(scenario_id,
           status = "errored",
           error_message = conditionMessage(e)
         )
-        # Back-compat alias; TODO(v0.8): drop, nothing in-package reads $error
-        fit$error <- fit$error_message
         fit
       }
     )

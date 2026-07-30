@@ -1,7 +1,7 @@
 Package: BATON
 Type: Package
 Title: Bayesian Optimization for Calibration of Adaptive Clinical Trials
-Version: 0.7.1
+Version: 0.8.0
 Authors@R:
     person(given = "Naim", family = "Rashid", role = c("aut", "cre"),
            email = "naim_rashid@unc.edu",

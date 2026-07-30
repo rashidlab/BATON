@@ -82,9 +82,25 @@ test_that("build_baton_fit rejects partial matches of documented statuses", {
   )
 })
 
+test_that("build_baton_fit rejects the removed legacy status 'completed'", {
+  # v0.8: "completed" was legacy vocabulary nothing constructed; it is now
+  # rejected like any other undocumented status.
+  expect_error(
+    build_baton_fit(
+      history = initialise_history(),
+      best_theta = NULL, best_objective = NA_real_, surrogates = NULL,
+      policies = NULL, diagnostics = NULL, multi_seed_summary = NULL,
+      multi_seed_runs = NULL, verdict = NA_character_, bounds = NULL,
+      constraints = NULL, constraint_tbl = NULL,
+      status = "completed"
+    ),
+    "Invalid status"
+  )
+})
+
 test_that("build_baton_fit accepts every documented status value", {
   for (s in c("budget_exhausted", "early_stopped", "acq_flatline",
-              "cancelled", "walltime", "errored", "checkpoint", "completed")) {
+              "cancelled", "walltime", "errored", "checkpoint")) {
     fit <- build_baton_fit(
       history = initialise_history(),
       best_theta = NULL, best_objective = NA_real_, surrogates = NULL,
@@ -98,7 +114,7 @@ test_that("build_baton_fit accepts every documented status value", {
   }
 })
 
-test_that("an errored philosophies fit is built by the helper with back-compat error field", {
+test_that("an errored philosophies fit is built by the helper", {
   skip_if_not_installed("DiceKriging")
   philosophies <- list(
     BadPhil = list(objective = "EN",
@@ -125,6 +141,8 @@ test_that("an errored philosophies fit is built by the helper with back-compat e
                   %in% names(fit)))
   expect_identical(class(fit), c("BATON_fit", "list"))
   expect_true(is.character(fit$error_message) && nzchar(fit$error_message))
-  # Back-compat: the old `error` field still carries the message.
-  expect_identical(fit$error, fit$error_message)
+  # v0.8: the back-compat `error` alias is gone; error_message is the only
+  # carrier of the failure message. [[ ]] for exact matching ($ would
+  # partial-match error_message).
+  expect_null(fit[["error"]])
 })

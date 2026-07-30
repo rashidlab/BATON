@@ -87,6 +87,9 @@
 #' @param fidelity_levels named numeric vector giving the number of simulator
 #'   replications associated with each fidelity level. Default: c(low=2000, med=4000,
 #'   high=10000), increased from (200, 1000, 10000) for reduced Monte Carlo variance.
+#'   The order of the input does not matter: the vector is canonicalized to
+#'   ascending replication count, so the initial design and the selection
+#'   methods' fallback always use the cheapest level.
 #' @param fidelity_method method for selecting fidelity level. Options:
 #'   \describe{
 #'     \item{\code{"adaptive"}}{(default) Cost-aware selection based on expected
@@ -203,7 +206,11 @@
 #'   `multi_seed_verify = TRUE`. If the callback cancels on the final
 #'   iteration (one that simultaneously ends the run because the budget is
 #'   exhausted), `status` records `"cancelled"` rather than
-#'   `"budget_exhausted"`, and Stage 4 verification is skipped. Default
+#'   `"budget_exhausted"`, and Stage 4 verification is skipped. The callback
+#'   must not modify the RNG state (no random draws, no `set.seed()`): the
+#'   optimizer's random-number stream determines the trajectory, so a hook
+#'   wanting randomness should save `.Random.seed` and restore it before
+#'   returning. Default
 #'   `NULL` (no callback).
 #' @param checkpoint_fun optional function invoked with a slim, resumable
 #'   `BATON_fit` snapshot (`status = "checkpoint"`) every `checkpoint_every`
@@ -220,7 +227,10 @@
 #'   refits surrogates from the recorded history and continues the run. The
 #'   return value of `checkpoint_fun` is ignored; an error it raises
 #'   produces a warning and the run continues (same rationale as
-#'   `callback`). Default `NULL` (no checkpoints).
+#'   `callback`). Like `callback`, `checkpoint_fun` must not modify the RNG
+#'   state (no random draws, no `set.seed()`); a hook wanting randomness
+#'   should save `.Random.seed` and restore it before returning. Default
+#'   `NULL` (no checkpoints).
 #' @param checkpoint_every single positive integer; number of completed BO
 #'   iterations between checkpoint snapshots. Used only when
 #'   `checkpoint_fun` is supplied. Default `5L`.
@@ -1035,6 +1045,12 @@ bo_calibrate <- function(sim_fun,
   }
 
   iter_counter <- 0L
+  # Evaluations actually consumed by the initial phase, captured at loop entry.
+  # This can differ from the requested n_init: donor augmentation sets n_init
+  # to the realized count, but GP-based init stopping breaks out of the LHS
+  # loop with eval_counter < n_init. The candidate-pool sizing below needs the
+  # real remaining iteration budget (budget - n_init_actual) / q.
+  n_init_actual <- eval_counter
   last_best_objective <- NA_real_
   last_best_objective_display <- Inf  # For progress display (observed best)
 
@@ -1191,18 +1207,10 @@ bo_calibrate <- function(sim_fun,
                                                     incumbent_method = incumbent_method)
 
     # Adaptive candidate pool size: scale with dimension and iteration
-    d <- length(bounds)
-    # Base size: 500 * dimension (min 1000, max 5000)
-    base_pool_size <- pmax(1000, pmin(5000, 500 * d))
-    # Early iterations: use base size
-    # Late iterations (last 30%): increase by 50% for refinement
-    if (iter_counter > 0.7 * (budget / q)) {
-      candidate_pool_size <- min(base_pool_size * 1.5, 10000)
-    } else {
-      candidate_pool_size <- base_pool_size
-    }
-    # Respect user's minimum if provided
-    candidate_pool_size <- max(candidate_pool_size, candidate_pool)
+    candidate_pool_size <- candidate_pool_size_for_iter(
+      iter_counter = iter_counter, d = length(bounds), budget = budget,
+      n_init = n_init_actual, q = q, candidate_pool = candidate_pool
+    )
 
     unit_candidates <- lhs_candidate_pool(candidate_pool_size, bounds)
 
@@ -1794,11 +1802,10 @@ build_baton_fit <- function(history, best_theta, best_objective, surrogates,
                             constraint_tbl, status, error_message = NULL) {
   # Exact matching (not match.arg) so partial matches like "budget" are
   # rejected. errored is constructed by the D7 on_error = "return_partial"
-  # path in bo_calibrate and by the philosophies wrapper's isolation layer;
-  # completed is legacy, slated for removal once nothing constructs it.
+  # path in bo_calibrate and by the philosophies wrapper's isolation layer.
+  # (The legacy "completed" value was removed in v0.8; nothing constructed it.)
   status_values <- c("budget_exhausted", "early_stopped", "acq_flatline",
-                     "cancelled", "walltime", "errored", "checkpoint",
-                     "completed")
+                     "cancelled", "walltime", "errored", "checkpoint")
   if (!is.character(status) || length(status) != 1L || !status %in% status_values) {
     stop(sprintf("Invalid status '%s'. Must be one of: %s",
                  paste(status, collapse = ", "),
@@ -2212,6 +2219,16 @@ default_variance_estimator <- function(metrics, n_rep) {
   result
 }
 
+#' Validate and canonicalize fidelity levels
+#'
+#' Beyond validation, the vector is CANONICALIZED: reordered ascending by
+#' replication count, so the input order never matters. Every downstream
+#' `names(fidelity_levels)[1]` (the initial-design fidelity and the
+#' staged/threshold/hybrid fallbacks) is therefore the cheapest level by
+#' construction; before v0.8 those sites used the first-NAMED level, so
+#' e.g. `c(high = 10000, low = 2000, med = 4000)` silently ran the whole
+#' initial design at 10000 replications.
+#'
 #' @keywords internal
 validate_fidelity_levels <- function(fidelity_levels) {
   if (is.null(names(fidelity_levels))) {
@@ -2233,7 +2250,10 @@ validate_fidelity_levels <- function(fidelity_levels) {
       stop("Fidelity replication counts must be positive.", call. = FALSE)
     }
   }
-  fidelity_levels
+  # Canonicalize: ascending by replication count (see roxygen above). Ordering
+  # follows the VALUES, so the cheapest level is always first-named even if
+  # the labels are assigned unconventionally.
+  fidelity_levels[order(unname(fidelity_levels))]
 }
 
 #' Unit coordinates of the best feasible design in the history
@@ -2265,6 +2285,39 @@ best_feasible_unit <- function(history, objective, bounds) {
   # bounds-ordered and the distance subtraction is positional: return in
   # names(bounds) order always.
   unit[names(bounds)]
+}
+
+#' Candidate-pool size for a BO iteration
+#'
+#' Base size scales with dimension (500 * d, clamped to [1000, 5000]). In the
+#' last 30 percent of the run's iteration budget the pool is inflated by 50
+#' percent (capped at 10000) for late-run refinement. The iteration budget is
+#' (budget - n_init) / q: the BO loop runs at most that many iterations after
+#' the initial phase has consumed n_init evaluations. (Before v0.8 the
+#' threshold was 0.7 * (budget / q), which the iteration counter can never
+#' exceed whenever n_init is at least 30 percent of budget, including the
+#' package defaults n_init = 90, budget = 300, so the inflation was
+#' unreachable.) `n_init` must be the number of evaluations ACTUALLY consumed
+#' by the initial phase (donors plus LHS top-up, or an init-stopped LHS
+#' design), not the requested value. The user's `candidate_pool` acts as a
+#' floor on the result throughout.
+#'
+#' @keywords internal
+candidate_pool_size_for_iter <- function(iter_counter, d, budget, n_init, q,
+                                         candidate_pool) {
+  base_pool_size <- pmax(1000, pmin(5000, 500 * d))
+  # ceiling(): a final partial batch is still a full iteration, so the loop
+  # runs ceiling((budget - n_init) / q) times; raw division would put the
+  # 70 percent threshold fractionally early on non-divisible shapes.
+  # Guarded for safety: the BO loop only runs when budget > n_init, so the
+  # iteration budget is positive whenever this is called from bo_calibrate.
+  iter_budget <- max(ceiling((budget - n_init) / q), 1)
+  if (iter_counter > 0.7 * iter_budget) {
+    pool_size <- min(base_pool_size * 1.5, 10000)
+  } else {
+    pool_size <- base_pool_size
+  }
+  max(pool_size, candidate_pool)
 }
 
 #' @keywords internal
@@ -2388,6 +2441,13 @@ compute_dynamic_fidelity_levels <- function(iter,
                                             budget_used = 0,
                                             budget_tolerance = 1.2,
                                             batch_size = 1) {
+  # v0.8: base_levels arrives canonicalized ascending by VALUE
+  # (validate_fidelity_levels), but proposed_levels below is built in
+  # low/med/high LABEL order and combined with base_levels POSITIONALLY
+  # (budget scale-back, pmax floor). Align base_levels to label order first
+  # so each label pairs with its own base value even when the values
+  # contradict the conventional label order (e.g. low = 500, high = 50).
+  base_levels <- base_levels[c("low", "med", "high")]
   # Calculate iteration phase (0 to 1)
   # Approximate max BO iterations (after initial design)
   # Note: n_init not directly available here, so we estimate
@@ -2456,7 +2516,11 @@ compute_dynamic_fidelity_levels <- function(iter,
   # Replace any remaining NAs with base levels
   proposed_levels[is.na(proposed_levels)] <- base_levels[is.na(proposed_levels)]
 
-  proposed_levels
+  # Canonicalize the return ascending by value: the caller swaps this vector
+  # in for fidelity_levels, whose invariant since v0.8 is that the first-named
+  # level is the cheapest (per-label scaling can reorder relative costs under
+  # unconventional labelings). Identity for conventional inputs.
+  proposed_levels[order(unname(proposed_levels))]
 }
 
 #' Hybrid staged-adaptive fidelity selection with metric-specific thresholds
@@ -2689,34 +2753,52 @@ select_fidelity_method <- function(method, ...) {
 #' Adaptive cost-aware fidelity selection
 #'
 #' Implements cost-aware fidelity selection inspired by MFKG (Wu & Frazier 2016).
-#' Selects fidelity by maximizing expected value per unit cost, with exploration
-#' decay and boundary detection.
+#' Trades an expected-information gain that grows with the level's replication
+#' count against that level's cost, with exploration decay, boundary detection,
+#' and an affordability guard on the remaining replication budget.
 #'
 #' @param prob_feasible probability of constraint satisfaction
 #' @param cv_estimate coefficient of variation from objective surrogate
 #' @param acq_value acquisition function value at candidate point
-#' @param best_obj current best objective value (used for context)
+#' @param best_obj current best feasible objective value, used to normalize the
+#'   acquisition value to a scale-free relative improvement (may be non-finite
+#'   before feasibility is reached, in which case the raw value is used)
 #' @param fidelity_levels named vector of fidelity levels (replication counts)
 #' @param fidelity_costs named vector of relative costs (default: proportional to replications)
 #' @param iter current iteration number
-#' @param total_budget_used cumulative simulation budget consumed
-#' @param total_budget approximate total simulation budget available
+#' @param total_budget_used cumulative simulation budget consumed (replications)
+#' @param total_budget approximate total simulation budget available (replications)
 #'
 #' @details
-#' The method balances information gain vs cost using:
+#' For each fidelity level \eqn{j} the method computes a net value
+#' \deqn{net_j = v \cdot g_j - \lambda (\tilde{c}_j^{\,\gamma} - 1)}
+#' and selects the level maximizing it, where:
 #' \itemize{
-#'   \item \strong{Value score}: acquisition * uncertainty * boundary_factor
+#'   \item \strong{Value score} \eqn{v}: acquisition * uncertainty * boundary
+#'     factors, a property of the candidate point only
 #'     \itemize{
 #'       \item High near feasibility boundary (prob ~= 0.5)
 #'       \item High when objective uncertain (large CV)
-#'       \item High for promising candidates (large acquisition)
+#'       \item High for promising candidates; the acquisition value is
+#'         normalized by |best_obj| so the factor is scale-free
 #'     }
-#'   \item \strong{Cost normalization}: Divide by cost^alpha where alpha decays from 0.5 to 0.8
-#'     \itemize{
-#'       \item Early: less cost-sensitive (exploration)
-#'       \item Late: more cost-sensitive (exploitation)
-#'     }
-#'   \item \strong{Exploration decay}: Randomization probability from 50\% to 10\%
+#'   \item \strong{Gain factor} \eqn{g_j = R_j / (R_j + R_{ref})}, rescaled so
+#'     the largest level has gain 1, with \eqn{R_{ref}} the median replication
+#'     count. This is the posterior-variance-reduction shape
+#'     \eqn{s^2 - (1/s^2 + R/\tau^2)^{-1}} under a Monte Carlo observation
+#'     noise of \eqn{\tau^2 / R}: monotone increasing and saturating in
+#'     \eqn{R_j}. It is what makes the numerator genuinely depend on the
+#'     candidate level, so escalation can actually occur.
+#'   \item \strong{Cost penalty}: \eqn{\lambda = 0.05} times the level's cost
+#'     relative to the cheapest, raised to exponent \eqn{\gamma} that grows
+#'     from ~0.2 to 0.55 with iteration and budget depletion. Low-value points
+#'     (small \eqn{v}) cannot overcome the penalty and stay at low fidelity;
+#'     late in the run escalation requires proportionally larger value.
+#'   \item \strong{Affordability guard}: levels whose replication count
+#'     exceeds the remaining budget are excluded (the cheapest always remains).
+#'   \item \strong{Exploration decay}: low fidelity is forced with probability
+#'     decaying from 50\% early to a 5\% floor, so early iterations explore
+#'     cheaply while late iterations spend precision on strong candidates.
 #' }
 #'
 #' @return name of selected fidelity level
@@ -2743,8 +2825,9 @@ select_fidelity_adaptive <- function(prob_feasible,
 
   fidelity_names <- names(fidelity_levels)
   costs <- fidelity_costs[fidelity_names]
+  reps <- as.numeric(fidelity_levels)
 
-  # === Compute value score ===
+  # === Compute value score (a property of the candidate point) ===
 
   # Uncertainty factor: higher CV -> more value in reducing uncertainty
   # Normalize to [0,1] range, assuming CV > 0.3 is very high
@@ -2755,9 +2838,17 @@ select_fidelity_adaptive <- function(prob_feasible,
   boundary_factor <- 1 - abs(2 * prob_feasible - 1)
   boundary_factor <- boundary_factor^0.5  # soften the effect
 
-  # Acquisition factor: diminishing returns on acquisition value
-  # Use log1p for numerical stability
-  acq_factor <- log1p(pmax(0, acq_value))
+  # Acquisition factor: scale-free relative improvement, saturating in [0, 1).
+  # EI-type acquisitions live on the objective's scale, so normalize by the
+  # incumbent before saturating; otherwise a small-magnitude objective would
+  # make every acquisition look negligible (and vice versa).
+  acq_pos <- pmax(0, acq_value)
+  acq_rel <- if (is.finite(best_obj)) {
+    acq_pos / max(abs(best_obj), 1e-8)
+  } else {
+    acq_pos  # no feasible incumbent yet: use the raw value
+  }
+  acq_factor <- acq_rel / (1 + acq_rel)
 
   # Combined value score - weight components based on optimization stage
   if (iter < 20) {
@@ -2771,35 +2862,60 @@ select_fidelity_adaptive <- function(prob_feasible,
     value_score <- acq_factor * (0.7 + 0.3 * uncertainty_factor) * (0.1 + 0.9 * boundary_factor)
   }
 
-  # === Compute cost sensitivity ===
+  # === Expected-information gain per level ===
 
-  # Normalize costs to [0, 1]
-  cost_normalized <- costs / max(costs)
+  # Posterior-variance reduction at the candidate scales as
+  #   s^2 * (s^2 R / tau^2) / (1 + s^2 R / tau^2),
+  # monotone increasing and saturating in the replication count R. Without
+  # tau^2 in hand, anchor the half-saturation point at the median level:
+  # gain_j = R_j / (R_j + R_ref). Rescale so the top level realizes the full
+  # value score. This is the fidelity dependence the pre-v0.8 code lacked
+  # (its value score was constant across levels, so the cheapest level always
+  # maximized value-per-cost and the method never escalated).
+  r_ref <- stats::median(reps)
+  gain <- reps / (reps + r_ref)
+  gain <- gain / max(gain)
 
-  # Cost exponent: increases with iteration (more cost-sensitive over time)
-  # Also increases as budget depletes
-  # Lower exponent = more willing to use high fidelity
+  # === Cost penalty ===
+
+  # Cost relative to the cheapest level, raised to an exponent that increases
+  # with iteration and budget depletion: escalation gets harder to justify as
+  # resources deplete, which preserves the staged intent (early exploration is
+  # cheap via the exploration override below; late exploitation escalates only
+  # for proportionally high-value candidates).
+  cost_rel <- costs / min(costs)
   budget_fraction_used <- pmin(1, total_budget_used / (total_budget + 1e-6))
-  cost_exponent <- 0.15 + 0.3 * pmin(1, iter / 100) + 0.2 * budget_fraction_used
-  cost_exponent <- pmin(cost_exponent, 0.8)  # cap at 0.8 (was 1.0)
+  cost_exponent <- 0.2 + 0.2 * pmin(1, iter / 100) + 0.15 * budget_fraction_used
+  cost_exponent <- pmin(cost_exponent, 0.55)
+  cost_weight <- 0.05
+  cost_penalty <- cost_weight * (cost_rel ^ cost_exponent - 1)
 
-  # === Value per cost ===
-  value_per_cost <- value_score / (cost_normalized ^ cost_exponent + 1e-6)
+  # === Net value per level ===
+  net_value <- value_score * gain - cost_penalty
+
+  # Affordability guard: never route to a level whose replication count
+  # exceeds the remaining budget (keep the cheapest as a fallback).
+  if (is.finite(total_budget) && total_budget > 0) {
+    remaining <- total_budget - total_budget_used
+    affordable <- reps <= remaining
+    if (!any(affordable)) affordable[which.min(reps)] <- TRUE
+    net_value[!affordable] <- -Inf
+  }
 
   # === Exploration randomization ===
 
   # Probability of forcing low fidelity for exploration
-  # Decays from 50% early to 5% late
+  # Decays from 50% early to a 5% floor
   exploration_prob <- pmax(0.05, 0.5 * exp(-iter / 30))
 
   if (stats::runif(1) < exploration_prob) {
     # Force exploration with low fidelity
-    return(fidelity_names[1])
+    return(fidelity_names[which.min(reps)])
   }
 
   # === Select fidelity ===
 
-  best_idx <- which.max(value_per_cost)
+  best_idx <- which.max(net_value)
   selected <- fidelity_names[best_idx]
 
   # === Diagnostics (optional) ===
@@ -2811,8 +2927,8 @@ select_fidelity_adaptive <- function(prob_feasible,
       "  Fidelity selection: prob_feas=%.3f, CV=%.3f, acq=%.3f, value=%.3f, cost_exp=%.2f -> %s",
       prob_feasible, cv_estimate, acq_value, value_score, cost_exponent, selected
     ))
-    message(sprintf("    Value/cost: %s",
-                    paste(sprintf("%s=%.2f", fidelity_names, value_per_cost), collapse=", ")))
+    message(sprintf("    Net value: %s",
+                    paste(sprintf("%s=%.3f", fidelity_names, net_value), collapse=", ")))
   }
 
   selected

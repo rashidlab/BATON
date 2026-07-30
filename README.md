@@ -2,7 +2,7 @@
 
 **Bayesian Optimization for Calibration of Adaptive Clinical Trials**
 
-Version 0.7.1 | R >= 4.2 | UNC not-for-profit license | [GitHub](https://github.com/rashidlab/BATON) | [Issues](https://github.com/rashidlab/BATON/issues)
+Version 0.8.0 | R >= 4.2 | UNC not-for-profit license | [GitHub](https://github.com/rashidlab/BATON) | [Issues](https://github.com/rashidlab/BATON/issues)
 
 Designing a clinical trial requires choosing design parameters -- for
 example, the maximum sample size, efficacy and futility decision thresholds,
@@ -33,6 +33,7 @@ while reserving high-replication runs for verification.
 
 | Version | Date | Headline |
 |---------|------|----------|
+| 0.8.0 | Jul 2026 | Fidelity machinery fixes: adaptive method truly escalates; pool inflation reachable; `fidelity_levels` order-independent |
 | 0.7.1 | Jul 2026 | Documentation release: self-contained Getting Started, new methods and case-study vignettes |
 | 0.7.0 | Jul 2026 | Service controls: `status` field, `max_walltime_s`, `callback` cancellation, `checkpoint_fun`, `on_error = "return_partial"`, `slim`; slimmer dependencies |
 | 0.6.0 | Jul 2026 | Optional `n_rep` simulator contract; parallel evaluation via `options(BATON.cores)`; matrix-based hot paths (58% faster candidate scoring) |
@@ -860,7 +861,7 @@ testthat::test_file("tests/testthat/test-BATON-core.R")
             Goetz, M. P. and Davidson, N. E. and Norton, L. and
             Perou, C. M. and Krop, I. E. and Wolff, A. C. and Winer, E. P. and
             Carey, L. A. and Rashid, N. U.},
-  note   = {Submitted. R package version 0.7.1,
+  note   = {Submitted. R package version 0.8.0,
             \url{https://github.com/rashidlab/BATON}},
   year   = {2026}
 }

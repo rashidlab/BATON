@@ -504,11 +504,11 @@ per metric), and selects from the pool. The pool size adapts to the
 problem: $500 \times d$ points, clamped to $[1000, 5000]$, with the
 `candidate_pool` argument (default 2000) acting as a floor. A late-run
 refinement inflates the pool by 50 percent (capped at 10,000) once the
-iteration count exceeds 70 percent of `budget / q`; because that
-threshold counts the budget in batches without subtracting the initial
-design, it engages only when `n_init` is below 30 percent of the
-budget, and under the package defaults (`n_init = 90`, `budget = 300`)
-it never fires. Derivative-free maximization over a space-filling pool is robust
+iteration count exceeds 70 percent of the run's iteration budget,
+`(budget - n_init) / q` rounded up (with `n_init` counted as the
+evaluations the initial phase actually consumed), so the last 30 percent of BO
+iterations search a denser pool regardless of how large the initial
+design was. Derivative-free maximization over a space-filling pool is robust
 to the multimodal, constraint-warped shape of the ECI surface and
 composes directly with the sequential penalization rule above.
 
@@ -518,12 +518,12 @@ composes directly with the sequential penalization rule above.
 
 `fidelity_levels` maps the labels `"low"`, `"med"`, `"high"` to
 replication counts (default `c(low = 2000, med = 4000, high = 10000)`).
-The initial design is evaluated entirely at the *first-named* level of
-`fidelity_levels`, and the selection methods below fall back to that
-same first-named level; under the default ordering that is `"low"`, but
-the names are accepted in any order, so reordering them changes which
-level plays this default role. Each BO batch point then gets its own
-fidelity decision.
+The names are accepted in any order: the vector is canonicalized to
+ascending replication count on entry, so the first-named level is
+always the *cheapest* one. The initial design is evaluated entirely at
+that cheapest level, and the selection methods below fall back to it;
+under the default values that is `"low"`. Each BO batch point then gets
+its own fidelity decision.
 
 How the chosen count reaches your simulator matters. BATON always passes
 the fidelity *label* as the `fidelity` argument. If the simulator
@@ -588,51 +588,75 @@ the objective's to the worst constraint's when the point sits in the
 boundary band. This is the most aggressive escalation schedule in the
 package.
 
-**Adaptive** (`"adaptive"`, the default) frames the choice as value per
-cost, in the spirit of cost-aware multi-fidelity acquisition (Wu and
-Frazier 2016). `select_fidelity_adaptive()` first builds a scalar value
-score for evaluating the candidate at all,
+**Adaptive** (`"adaptive"`, the default) frames the choice as expected
+information gain net of cost, in the spirit of cost-aware multi-fidelity
+acquisition (Wu and Frazier 2016). `select_fidelity_adaptive()` first
+builds a scalar value score for the candidate point,
 
 $$
-v = \log(1 + \alpha) \cdot
+v = \frac{\tilde{\alpha}}{1 + \tilde{\alpha}} \cdot
 w_u\!\left(\min\{1, \mathrm{CV}/0.3\}\right) \cdot
 w_b\!\left(\sqrt{1 - |2P - 1|}\right),
+\qquad \tilde{\alpha} = \frac{\max(\alpha, 0)}{|f^\ast|},
 $$
 
-the product of the (log-damped) acquisition value, an uncertainty factor
-that saturates at CV $= 0.3$, and a boundary factor peaking at
-$P(\text{feasible}) = 0.5$. The affine weights $w_u, w_b$ shift with the
-run's stage: before iteration 20 the uncertainty factor dominates
-(exploration), between 20 and 60 the two balance, after 60 the boundary
-factor dominates (exploitation). Each fidelity's cost (by default
-proportional to its replication count, overridable via
-`fidelity_costs`) is normalized to $(0,1]$ and raised to a cost exponent
+the product of a saturating acquisition factor (the acquisition value
+$\alpha$ normalized by the incumbent objective $f^\ast$, so the factor
+is scale-free), an uncertainty factor that saturates at CV $= 0.3$, and
+a boundary factor peaking at $P(\text{feasible}) = 0.5$. The affine
+weights $w_u, w_b$ shift with the run's stage: before iteration 20 the
+uncertainty factor dominates (exploration), between 20 and 60 the two
+balance, after 60 the boundary factor dominates (exploitation).
+
+What distinguishes the levels is a gain factor
+$g_j = R_j / (R_j + R_{\mathrm{ref}})$, rescaled so the largest level
+has gain 1, with $R_{\mathrm{ref}}$ the median replication count. This
+is the shape of the posterior-variance reduction at the candidate when
+the new observation arrives with Monte Carlo noise $\tau^2/R$: monotone
+increasing and saturating in $R$, so higher fidelity buys more
+information, with diminishing returns. Each level is then scored as
 
 $$
-\gamma = \min\{\,0.15 + 0.3\min(1, t/100) + 0.2\,\beta,\;\; 0.8\,\},
+\mathrm{net}_j = v\,g_j - \lambda\left(\tilde{c}_j^{\,\gamma} - 1\right),
+\qquad \lambda = 0.05,
 $$
 
-which increases with iteration $t$ and with the fraction $\beta$ of the
-replication budget already consumed: the search becomes more
-cost-sensitive as resources deplete. The method then maximizes $v /
-(\tilde{c}^{\,\gamma} + 10^{-6})$ over the levels, after an exploration
-override that forces low fidelity with probability
-$\max\{0.05, 0.5\,e^{-t/30}\}$.
+where $\tilde{c}_j$ is the level's cost relative to the cheapest (by
+default proportional to its replication count, overridable via
+`fidelity_costs`) and the cost exponent
 
-One property of this construction deserves an honest flag: the value
-score $v$ is the same number for every fidelity level (nothing in it
-depends on $R$), so the value-per-cost ranking is decided entirely by
-the cost term, and whenever the levels have unequal costs the cheapest
-level maximizes it. In the current implementation the adaptive method is
-therefore maximally cost-conservative: it keeps the whole search at the
-lowest fidelity and relies on the heteroskedastic surrogate to weigh the
-resulting noisy evaluations appropriately (plus the optional Stage 4
-verification, Section 5, for a high-precision check of the final
-design). If you want fidelity escalation during the search itself, use
-`"threshold"`, `"staged"`, or `"hybrid_staged"`. The demonstration below
-uses `"threshold"` for exactly this reason, and because the staged
-schedules operate on iteration scales (30 to 100 iterations) that a
-vignette-sized run never reaches.
+$$
+\gamma = \min\{\,0.2 + 0.2\min(1, t/100) + 0.15\,\beta,\;\; 0.55\,\}
+$$
+
+increases with iteration $t$ and with the fraction $\beta$ of the
+replication budget already consumed, so escalation gets harder to
+justify as resources deplete. Levels whose replication count exceeds the
+remaining budget are excluded outright, and an exploration override
+forces low fidelity with probability $\max\{0.05, 0.5\,e^{-t/30}\}$. The
+staged intent survives in three places: early iterations explore cheaply
+because the exploration override fires often and $w_u$ favors the
+uncertainty signal; mid-run, strong candidates near the boundary clear
+the cost penalty and escalate; late iterations escalate only candidates
+whose value score is proportionally larger, because $\gamma$ has risen
+and the affordability guard protects the remaining budget.
+
+Two consequences worth knowing. First, escalation is genuinely
+value-driven: a candidate is promoted only when its scale-free value
+score clears the cost penalty, so a smooth, fast-converging problem can
+legitimately run entirely at low fidelity (the acquisition and boundary
+signals fade as the surrogates converge), while a problem whose
+incumbent is still moving escalates its strongest candidates to medium
+or high. (Prior to v0.8 the value score had no fidelity dependence at
+all, so the cheapest level always maximized value-per-cost and the
+method never escalated; v0.8 fixed that.) Second, the demonstration
+below uses `"threshold"` rather than the default: the threshold ladder
+makes the routing transparent, since each pick's tier is a direct
+function of its feasibility probability, whereas the adaptive score
+depends on four interacting signals, and on a toy problem this small and
+smooth the adaptive method concludes, correctly, that low fidelity
+suffices throughout. The staged schedules likewise operate on iteration
+scales (30 to 100 iterations) that a vignette-sized run never reaches.
 
 ## Demonstration: fidelity routing in a tiny run
 

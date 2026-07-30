@@ -26,7 +26,9 @@ select_fidelity_adaptive(
 
 \item{acq_value}{acquisition function value at candidate point}
 
-\item{best_obj}{current best objective value (used for context)}
+\item{best_obj}{current best feasible objective value, used to normalize the
+acquisition value to a scale-free relative improvement (may be non-finite
+before feasibility is reached, in which case the raw value is used)}
 
 \item{fidelity_levels}{named vector of fidelity levels (replication counts)}
 
@@ -34,33 +36,49 @@ select_fidelity_adaptive(
 
 \item{iter}{current iteration number}
 
-\item{total_budget_used}{cumulative simulation budget consumed}
+\item{total_budget_used}{cumulative simulation budget consumed (replications)}
 
-\item{total_budget}{approximate total simulation budget available}
+\item{total_budget}{approximate total simulation budget available (replications)}
 }
 \value{
 name of selected fidelity level
 }
 \description{
 Implements cost-aware fidelity selection inspired by MFKG (Wu & Frazier 2016).
-Selects fidelity by maximizing expected value per unit cost, with exploration
-decay and boundary detection.
+Trades an expected-information gain that grows with the level's replication
+count against that level's cost, with exploration decay, boundary detection,
+and an affordability guard on the remaining replication budget.
 }
 \details{
-The method balances information gain vs cost using:
+For each fidelity level \eqn{j} the method computes a net value
+\deqn{net_j = v \cdot g_j - \lambda (\tilde{c}_j^{\,\gamma} - 1)}
+and selects the level maximizing it, where:
 \itemize{
-  \item \strong{Value score}: acquisition * uncertainty * boundary_factor
+  \item \strong{Value score} \eqn{v}: acquisition * uncertainty * boundary
+    factors, a property of the candidate point only
     \itemize{
       \item High near feasibility boundary (prob ~= 0.5)
       \item High when objective uncertain (large CV)
-      \item High for promising candidates (large acquisition)
+      \item High for promising candidates; the acquisition value is
+        normalized by |best_obj| so the factor is scale-free
     }
-  \item \strong{Cost normalization}: Divide by cost^alpha where alpha decays from 0.5 to 0.8
-    \itemize{
-      \item Early: less cost-sensitive (exploration)
-      \item Late: more cost-sensitive (exploitation)
-    }
-  \item \strong{Exploration decay}: Randomization probability from 50\% to 10\%
+  \item \strong{Gain factor} \eqn{g_j = R_j / (R_j + R_{ref})}, rescaled so
+    the largest level has gain 1, with \eqn{R_{ref}} the median replication
+    count. This is the posterior-variance-reduction shape
+    \eqn{s^2 - (1/s^2 + R/\tau^2)^{-1}} under a Monte Carlo observation
+    noise of \eqn{\tau^2 / R}: monotone increasing and saturating in
+    \eqn{R_j}. It is what makes the numerator genuinely depend on the
+    candidate level, so escalation can actually occur.
+  \item \strong{Cost penalty}: \eqn{\lambda = 0.05} times the level's cost
+    relative to the cheapest, raised to exponent \eqn{\gamma} that grows
+    from ~0.2 to 0.55 with iteration and budget depletion. Low-value points
+    (small \eqn{v}) cannot overcome the penalty and stay at low fidelity;
+    late in the run escalation requires proportionally larger value.
+  \item \strong{Affordability guard}: levels whose replication count
+    exceeds the remaining budget are excluded (the cheapest always remains).
+  \item \strong{Exploration decay}: low fidelity is forced with probability
+    decaying from 50\% early to a 5\% floor, so early iterations explore
+    cheaply while late iterations spend precision on strong candidates.
 }
 }
 \references{

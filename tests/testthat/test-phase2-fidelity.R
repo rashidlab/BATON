@@ -347,6 +347,145 @@ test_that("fidelity selection uses acquisition value correctly", {
   expect_gte(high_med_ratio_high_acq, high_med_ratio_low_acq)
 })
 
+test_that("adaptive method escalates for high-value candidates (v0.8 defect 1)", {
+  skip_on_cran()
+
+  # Regression guard for the v0.8 defect: value_score had no fidelity
+  # dependence, so value-per-cost was maximized by the cheapest level in
+  # every one of 200 empirical calls, even with high-value inputs.
+  fidelity_levels <- c(low = 200, med = 1000, high = 10000)
+  fidelity_costs <- c(low = 1, med = 5, high = 50)
+
+  set.seed(42)
+  selections <- replicate(200, {
+    BATON:::select_fidelity_adaptive(
+      prob_feasible = 0.5,   # on the feasibility boundary
+      cv_estimate = 0.3,     # high uncertainty
+      acq_value = 2.0,       # high acquisition
+      best_obj = 10,
+      fidelity_levels = fidelity_levels,
+      fidelity_costs = fidelity_costs,
+      iter = 10,
+      total_budget_used = 5000,
+      total_budget = 150000
+    )
+  })
+
+  non_low <- mean(selections != "low")
+  expect_gte(non_low, 0.30)
+})
+
+test_that("adaptive method keeps low-value candidates at low fidelity", {
+  skip_on_cran()
+
+  fidelity_levels <- c(low = 200, med = 1000, high = 10000)
+  fidelity_costs <- c(low = 1, med = 5, high = 50)
+
+  set.seed(42)
+  selections <- replicate(200, {
+    BATON:::select_fidelity_adaptive(
+      prob_feasible = 0.95,  # far from the boundary
+      cv_estimate = 0.05,    # low uncertainty
+      acq_value = 0.1,       # low acquisition
+      best_obj = 10,
+      fidelity_levels = fidelity_levels,
+      fidelity_costs = fidelity_costs,
+      iter = 50,
+      total_budget_used = 50000,
+      total_budget = 150000
+    )
+  })
+
+  expect_gte(mean(selections == "low"), 0.80)
+})
+
+test_that("adaptive selection is monotone nondecreasing in cv_estimate", {
+  skip_on_cran()
+
+  fidelity_levels <- c(low = 200, med = 1000, high = 10000)
+  fidelity_costs <- c(low = 1, med = 5, high = 50)
+
+  cv_grid <- seq(0, 0.3, by = 0.025)
+  # Same seed per call so the exploration draw is identical across the grid;
+  # only cv_estimate varies.
+  chosen_reps <- vapply(cv_grid, function(cv) {
+    set.seed(7)
+    sel <- BATON:::select_fidelity_adaptive(
+      prob_feasible = 0.5,
+      cv_estimate = cv,
+      acq_value = 2.0,
+      best_obj = 10,
+      fidelity_levels = fidelity_levels,
+      fidelity_costs = fidelity_costs,
+      iter = 80,   # late enough that the exploration override is at its floor
+      total_budget_used = 60000,
+      total_budget = 150000
+    )
+    fidelity_levels[[sel]]
+  }, numeric(1))
+
+  # As uncertainty grows the chosen replication count must never decrease.
+  expect_true(all(diff(chosen_reps) >= 0))
+  # And the grid must actually exercise an escalation, not sit constant.
+  expect_gt(max(chosen_reps), min(chosen_reps))
+})
+
+test_that("raising a level's cost reduces how often it is selected", {
+  skip_on_cran()
+
+  fidelity_levels <- c(low = 200, med = 1000, high = 10000)
+  costs_cheap <- c(low = 1, med = 5, high = 50)
+  costs_dear  <- c(low = 1, med = 5, high = 500)
+
+  pick <- function(costs, seed) {
+    set.seed(seed)
+    BATON:::select_fidelity_adaptive(
+      prob_feasible = 0.5,
+      cv_estimate = 0.3,
+      acq_value = 2.0,
+      best_obj = 10,
+      fidelity_levels = fidelity_levels,
+      fidelity_costs = costs,
+      iter = 10,
+      total_budget_used = 5000,
+      total_budget = 150000
+    )
+  }
+
+  sel_cheap <- vapply(1:100, function(s) pick(costs_cheap, s), character(1))
+  sel_dear  <- vapply(1:100, function(s) pick(costs_dear, s), character(1))
+
+  n_high_cheap <- sum(sel_cheap == "high")
+  n_high_dear <- sum(sel_dear == "high")
+  expect_gt(n_high_cheap, 0)          # cheap high gets selected at all
+  expect_lt(n_high_dear, n_high_cheap)  # inflating its cost suppresses it
+})
+
+test_that("adaptive method never selects a level the remaining budget cannot afford", {
+  skip_on_cran()
+
+  fidelity_levels <- c(low = 200, med = 1000, high = 10000)
+  fidelity_costs <- c(low = 1, med = 5, high = 50)
+
+  # Remaining replication budget (5000) is below high's 10000 reps, so even a
+  # maximally valuable candidate must not be routed to high.
+  set.seed(42)
+  selections <- replicate(50, {
+    BATON:::select_fidelity_adaptive(
+      prob_feasible = 0.5,
+      cv_estimate = 0.3,
+      acq_value = 5.0,
+      best_obj = 10,
+      fidelity_levels = fidelity_levels,
+      fidelity_costs = fidelity_costs,
+      iter = 40,
+      total_budget_used = 145000,
+      total_budget = 150000
+    )
+  })
+  expect_false(any(selections == "high"))
+})
+
 test_that("exploration probability decays with iteration", {
   skip_on_cran()
 
@@ -392,4 +531,76 @@ test_that("exploration probability decays with iteration", {
 
   # Late iterations should use high fidelity more often (when it's optimal)
   expect_gte(high_ratio_late, high_ratio_early * 0.8)  # Allow some variance
+})
+
+test_that("validate_fidelity_levels canonicalizes to ascending replication count (v0.8 defect 3)", {
+  out <- validate_fidelity_levels(c(high = 10000, low = 2000, med = 4000))
+  expect_identical(names(out), c("low", "med", "high"))
+  expect_identical(unname(out), c(2000, 4000, 10000))
+  # Already-ascending input passes through unchanged.
+  out2 <- validate_fidelity_levels(c(low = 2000, med = 4000, high = 10000))
+  expect_identical(names(out2), c("low", "med", "high"))
+  # Ordering follows the VALUES, not the conventional label order: the
+  # first-named (cheapest) level is correct-by-construction downstream.
+  out3 <- validate_fidelity_levels(c(low = 500, high = 50, med = 200))
+  expect_identical(names(out3), c("high", "med", "low"))
+  expect_identical(unname(out3), c(50, 200, 500))
+})
+
+test_that("initial design runs at the cheapest level under any input ordering (v0.8 defect 3)", {
+  skip_if_not_installed("DiceKriging")
+  fid_sim <- function(theta, fidelity = "low", seed = NULL, n_rep = NULL, ...) {
+    x <- as.numeric(unlist(theta))
+    res <- c(power = 0.9, EN = sum((x - 0.5)^2) * 10)
+    attr(res, "variance") <- c(power = 0.001, EN = 0.5)
+    res
+  }
+  fit <- suppressMessages(suppressWarnings(bo_calibrate(
+    sim_fun = fid_sim,
+    bounds = list(x1 = c(0, 1), x2 = c(0, 1)),
+    objective = "EN", constraints = list(power = c("ge", 0.8)),
+    n_init = 5, q = 1, budget = 5, seed = 1, progress = FALSE,
+    fidelity_levels = c(high = 30, low = 10, med = 20)
+  )))
+  init_rows <- fit$history[fit$history$iter == 0L, ]
+  expect_equal(nrow(init_rows), 5L)
+  # On pre-fix code the first-named level ("high", 30 reps) silently ran the
+  # whole initial design; canonicalization makes it the cheapest (10 reps).
+  expect_true(all(init_rows$fidelity == "low"))
+  expect_true(all(init_rows$n_rep == 10L))
+})
+
+test_that("dynamic fidelity scaling pairs each label with its own base value (v0.8)", {
+  # Pathological but officially accepted labeling: values contradict the
+  # conventional label order, so canonicalization yields names high, med, low.
+  base <- validate_fidelity_levels(c(low = 500, high = 50, med = 200))
+  expect_identical(names(base), c("high", "med", "low"))
+  # Middle phase (iter_fraction ~0.43): scales low 1.5x, med 1.5x, high 2.0x.
+  # budget_used = 0.8 * theoretical keeps both the budget scale-back and the
+  # >0.85 safety factor inactive, so the expected values are exact.
+  out <- compute_dynamic_fidelity_levels(
+    iter = 30, budget = 100, base_levels = base,
+    budget_used = 0.8 * 100 * mean(base), batch_size = 1
+  )
+  # Per-LABEL scaling: "high" (50 reps) doubles to 100; positional pairing
+  # against the value-sorted base would instead floor it at 500.
+  expect_equal(out[["high"]], 100)
+  expect_equal(out[["med"]], 300)
+  expect_equal(out[["low"]], 750)
+  # Return is canonicalized ascending: first-named stays the cheapest even
+  # after per-label scaling reorders relative costs.
+  expect_false(is.unsorted(unname(out)))
+  expect_identical(names(out)[1], "high")
+})
+
+test_that("dynamic fidelity scaling is unchanged for conventional labelings (v0.8)", {
+  base <- validate_fidelity_levels(c(low = 200, med = 1000, high = 5000))
+  out <- compute_dynamic_fidelity_levels(
+    iter = 30, budget = 100, base_levels = base,
+    budget_used = 0.8 * 100 * mean(base), batch_size = 1
+  )
+  expect_equal(out[["low"]], 300)     # 200 * 1.5
+  expect_equal(out[["med"]], 1500)    # 1000 * 1.5
+  expect_equal(out[["high"]], 10000)  # 5000 * 2.0
+  expect_identical(names(out), c("low", "med", "high"))
 })
