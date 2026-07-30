@@ -1,5 +1,33 @@
 # BATON Changelog
 
+## BATON 0.7.1 (2026-07-30)
+
+Documentation release; no code changes beyond two small guards shipped
+with the earlier README overhaul.
+
+- **BATON-introduction rewritten as a self-contained, discursive Getting
+  Started guide** (1000+ lines): the evaluator contract and minimal
+  template with per-line narration, a fully narrated worked example with
+  real captured output, per-knob settings guidance with failure modes,
+  the quick/balanced/thorough run profiles, live demonstrations of
+  infeasibility, verification, and integer rounding, and a trust
+  checklist. No longer defers to the GitHub README.
+- **New vignette `BATON-methods`**: how the optimizer works. GP
+  surrogates under Monte Carlo noise, expected constrained improvement,
+  local-penalization batching, multi-fidelity budgeting, the iteration
+  loop, and the seeding architecture behind core-count-independent
+  reproducibility, with small executed demonstrations. Paraphrases and
+  cites the companion manuscript; where manuscript and code differ, the
+  vignette describes the code.
+- **New vignette `BATON-case-study`**: an end-to-end calibration of a
+  group-sequential design carried from problem statement through
+  quick-profile exploration, a precomputed balanced run, the trust
+  pipeline (including an instructive multi-seed FAIL and its remedy),
+  sensitivity analysis, benchmarking against random and grid search,
+  constraint reliability, multi-philosophy calibration with warm-start
+  donors, and long-run service controls. Heavy results ship precomputed
+  (12 KB) with the generating script included.
+
 ## BATON 0.7.0 (2026-07-24)
 
 Service-readiness release (Phase D of the 2026-07 review plan): run controls

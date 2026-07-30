@@ -2,7 +2,7 @@
 
 **Bayesian Optimization for Calibration of Adaptive Clinical Trials**
 
-Version 0.7.0 | R >= 4.2 | UNC not-for-profit license | [GitHub](https://github.com/rashidlab/BATON) | [Issues](https://github.com/rashidlab/BATON/issues)
+Version 0.7.1 | R >= 4.2 | UNC not-for-profit license | [GitHub](https://github.com/rashidlab/BATON) | [Issues](https://github.com/rashidlab/BATON/issues)
 
 Designing a clinical trial requires choosing design parameters -- for
 example, the maximum sample size, efficacy and futility decision thresholds,
@@ -33,6 +33,7 @@ while reserving high-replication runs for verification.
 
 | Version | Date | Headline |
 |---------|------|----------|
+| 0.7.1 | Jul 2026 | Documentation release: self-contained Getting Started, new methods and case-study vignettes |
 | 0.7.0 | Jul 2026 | Service controls: `status` field, `max_walltime_s`, `callback` cancellation, `checkpoint_fun`, `on_error = "return_partial"`, `slim`; slimmer dependencies |
 | 0.6.0 | Jul 2026 | Optional `n_rep` simulator contract; parallel evaluation via `options(BATON.cores)`; matrix-based hot paths (58% faster candidate scoring) |
 | 0.5.0 | Jul 2026 | Correctness release from a full code review: working warm-start, corrected batch penalization, robustness fixes |
@@ -813,7 +814,9 @@ inst/examples/
   run_demo.R
   simulator_with_variance.R
 vignettes/
-  BATON-introduction.Rmd
+  BATON-introduction.Rmd   # Getting started (self-contained)
+  BATON-methods.Rmd        # How the optimizer works
+  BATON-case-study.Rmd     # End-to-end workflow with the analysis helpers
   advanced-features.Rmd
   v04-hardening.Rmd
   variance-estimation.Rmd
@@ -827,7 +830,9 @@ initialization).
 ## Vignettes and Documentation
 
 ```r
-vignette("BATON-introduction")  # Overview
+vignette("BATON-introduction")  # Getting started: evaluator, settings, trust checklist
+vignette("BATON-methods")       # How it works: GP surrogates, ECI, multi-fidelity, seeding
+vignette("BATON-case-study")    # End to end: calibrate, verify, sensitivity, benchmark
 vignette("advanced-features")   # Multi-stage, warm-start, fidelity control
 vignette("v04-hardening")       # Cross-philosophy warm-start, multi-seed verification
 vignette("variance-estimation") # Welford's algorithm
@@ -846,13 +851,18 @@ testthat::test_file("tests/testthat/test-BATON-core.R")
 ## Citation
 
 ```bibtex
-@article{rashid2026baton,
-  title   = {Constrained {Bayesian} Optimization for Calibration of
-             {Bayesian} Adaptive Clinical Trials},
-  author  = {Rashid, Naim},
-  journal = {Journal of the American Statistical Association},
-  year    = {2026},
-  note    = {R package version 0.7.0, \url{https://github.com/rashidlab/BATON}}
+@unpublished{young2026baton,
+  title  = {{BATON}: Constrained {Bayesian} Optimization for Calibrating
+            Adaptive Trials},
+  author = {Young, A. M. and Li, D. and Hilsenbeck, S. G. and Tayob, N. and
+            Chen, R. and Yuan, Y. and Bates, S. and Kelly, E. and Burns, R. and
+            Jhaveri, K. and Tolaney, S. M. and Spears, P. A. and
+            Goetz, M. P. and Davidson, N. E. and Norton, L. and
+            Perou, C. M. and Krop, I. E. and Wolff, A. C. and Winer, E. P. and
+            Carey, L. A. and Rashid, N. U.},
+  note   = {Submitted. R package version 0.7.1,
+            \url{https://github.com/rashidlab/BATON}},
+  year   = {2026}
 }
 ```
 

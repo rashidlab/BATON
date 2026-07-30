@@ -1,0 +1,1039 @@
+---
+title: "An End-to-End Calibration Case Study"
+author: "BATON Package Authors"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{An End-to-End Calibration Case Study}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4.5
+)
+# Suppress the one-time q-default migration note so chunk output stays clean.
+options(BATON.q_warning_shown = TRUE)
+has_ggplot2 <- requireNamespace("ggplot2", quietly = TRUE)
+# Precomputed results for the heavy stages; see the note in the text.
+cs <- readRDS("precompute/case_study_results.rds")
+```
+
+```{r load}
+library(BATON)
+```
+
+This vignette carries one realistic trial calibration from problem statement
+to final verified design, exercising the package's analysis helpers in the
+order you would actually use them: build and test an evaluator, explore,
+calibrate, verify, probe sensitivity, benchmark the method, quantify
+reliability, and compare design philosophies. The two sibling vignettes
+cover the ground on either side: `vignette("BATON-introduction")` teaches
+the core workflow, and `vignette("BATON-methods")` explains the machinery.
+This one is about the workflow around a real decision.
+
+A note on reproducibility before we start. The expensive stages of this
+case study (the main calibration, the benchmark, the reliability study, and
+the philosophy comparison) are not executed when this document is knitted.
+They were run by the included script
+`vignettes/precompute/case-study-precompute.R`, which saves compact results
+to `case_study_results.rds`; the vignette loads that file and displays the
+stored output, and every code chunk shown for a precomputed stage is
+verbatim what the script ran. Re-run the script to reproduce everything.
+On this vignette's deliberately fast simulator the whole script takes well
+under a minute; the pattern matters because with a realistic patient-level
+simulator the same stages take hours to days, and you do not want a
+document rebuild to trigger them. Cheap steps (the evaluator checks, the
+quick exploration run, the verification arithmetic) do run live at knit
+time.
+
+# The Design Problem
+
+A randomized two-arm phase II trial compares an experimental treatment
+against control on a binary response endpoint. The control response rate
+is assumed to be 25%, and the treatment is considered clinically
+interesting if it lifts response to 45%. The sponsor wants one interim
+analysis with both an efficacy boundary (stop early and declare success if
+the interim result is overwhelming) and a binding futility boundary (stop
+early and give up if the interim result is poor). The regulatory
+constraints are conventional: one-sided type I error at most 0.025 and
+power at least 0.85 under the alternative.
+
+Four numbers fully specify a design in this family, and all four are
+calibrated jointly:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `n_max` | Maximum total sample size (both arms, 1:1 allocation) |
+| `t_interim` | Fraction of `n_max` enrolled at the interim look |
+| `c_eff` | Efficacy boundary parameter: the final-analysis critical value; the interim efficacy boundary is `c_eff / sqrt(t)` (an O'Brien-Fleming-type shape) |
+| `c_fut` | Interim futility boundary on the z scale (binding: cross it and the trial stops for futility) |
+
+The objective is to minimize the expected total sample size under the
+alternative, `EN`, subject to the two constraints. The clinical logic of
+that choice: if the treatment works, early efficacy stopping gets the
+answer with fewer patients randomized, shortens the trial, and accelerates
+the next phase; if it does not work, the futility boundary limits patient
+exposure, and the type I error constraint caps the risk of a false
+positive. The trade-off being negotiated is real. A larger `n_max` buys
+power but inflates every trial that runs to the end; an aggressive
+efficacy boundary saves patients but spends type I error at the interim; a
+tight futility boundary protects patients under the null but erodes power
+under the alternative. No single parameter can be chosen sensibly in
+isolation, which is what makes this a calibration problem rather than a
+lookup.
+
+# Building and Testing the Evaluator
+
+The evaluator follows the canonical BATON contract
+(`function(theta, fidelity, seed = NULL, n_rep = NULL, ...)`) and
+simulates under both hypotheses in every call, because power must be
+estimated under the alternative and type I error under the null. The
+statistical content: patients are Bernoulli responders; at the interim,
+with `n1` patients per arm, a pooled two-sample z statistic is compared to
+the efficacy boundary `c_eff / sqrt(t)` and the futility boundary `c_fut`;
+trials that continue enroll to `n_max` and reject if the final z statistic
+exceeds `c_eff`. The chunk below is identical to the copy in the
+precompute script.
+
+```{r simulator}
+p_control <- 0.25   # control-arm response rate (null and alternative)
+p_treat   <- 0.45   # treatment-arm response rate under the alternative
+
+gs_simulator <- function(theta, fidelity = c("low", "med", "high"),
+                         seed = NULL, n_rep = NULL, ...) {
+  fidelity <- match.arg(fidelity)
+  if (is.null(n_rep)) {
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
+  if (!is.null(seed)) set.seed(seed)
+
+  # Design parameters (theta arrives fractional; realize an integer design)
+  n_arm  <- floor(round(theta$n_max) / 2)            # per-arm maximum
+  n1     <- max(2L, round(theta$t_interim * n_arm))  # per-arm at interim
+  n2     <- n_arm - n1                               # per-arm stage-2 increment
+  t_frac <- n1 / n_arm                               # realized information fraction
+  c_interim <- theta$c_eff / sqrt(t_frac)  # O'Brien-Fleming-type interim bound
+  c_final   <- theta$c_eff                 # final-analysis critical value
+  c_fut     <- theta$c_fut                 # binding interim futility bound
+
+  # Pooled two-sample z statistic for a difference in proportions
+  z_stat <- function(x_t, x_c, n) {
+    pbar <- (x_t + x_c) / (2 * n)
+    se <- sqrt(pmax(pbar * (1 - pbar) * 2 / n, 1e-12))
+    ifelse(pbar <= 0 | pbar >= 1, 0, (x_t / n - x_c / n) / se)
+  }
+
+  run_hypothesis <- function(p_trt) {
+    xt1 <- rbinom(n_rep, n1, p_trt)
+    xc1 <- rbinom(n_rep, n1, p_control)
+    z1  <- z_stat(xt1, xc1, n1)
+    stop_eff <- z1 >= c_interim
+    stop_fut <- !stop_eff & (z1 <= c_fut)
+    continue <- !stop_eff & !stop_fut
+    xt2 <- rbinom(n_rep, n2, p_trt)
+    xc2 <- rbinom(n_rep, n2, p_control)
+    z2  <- z_stat(xt1 + xt2, xc1 + xc2, n_arm)
+    reject  <- stop_eff | (continue & z2 > c_final)
+    n_total <- ifelse(continue, 2 * n_arm, 2 * n1)
+    list(reject = reject, n_total = n_total)
+  }
+
+  alt  <- run_hypothesis(p_treat)    # alternative: treatment works
+  null <- run_hypothesis(p_control)  # null: treatment equals control
+
+  metrics <- c(power = mean(alt$reject),
+               type1 = mean(null$reject),
+               EN    = mean(alt$n_total))
+  attr(metrics, "variance") <- c(power = var(alt$reject)  / n_rep,
+                                 type1 = var(null$reject) / n_rep,
+                                 EN    = var(alt$n_total) / n_rep)
+  attr(metrics, "n_rep") <- n_rep
+  metrics
+}
+```
+
+Contract details worth pausing on. The `n_rep = NULL` default with the
+`switch()` fallback means BATON's exact requested replication count is
+used when BATON calls the evaluator, while manual calls (like the checks
+below) get sensible tier defaults. The `variance` and `n_rep` attributes
+turn on the heteroskedastic surrogate, which matters here: the Monte Carlo
+variance of `EN` depends strongly on the design (a design that stops at
+the interim 40% of the time has a bimodal sample-size distribution; one
+that rarely stops concentrates at `n_max`).
+
+Because each replicate is a couple of `rbinom()` draws, the whole tier is
+vectorized and the variance of each mean is just `var(x) / n_rep`. When
+one replicate is a genuine function call (a patient-level simulation with
+accrual, dropout, and response modeling), you cannot vectorize, and
+storing every replicate to compute the variance gets expensive at high
+tiers. That is what `welford_mean_var()` is for: it runs the
+one-replicate function `n_rep` times and returns the mean and the
+variance of the mean in a single pass with O(1) memory. It computes
+exactly the same quantities:
+
+```{r welford-demo}
+set.seed(42)
+reps <- matrix(rnorm(5000 * 3), ncol = 3,
+               dimnames = list(NULL, c("power", "type1", "EN")))
+w <- welford_mean_var(function(i, data) data[i, ], n_samples = nrow(reps),
+                      data = reps)
+all.equal(w$mean, colMeans(reps))
+all.equal(w$variance, apply(reps, 2, var) / nrow(reps))
+```
+
+Same numbers, never more than one replicate in memory. See
+`vignette("variance-estimation")` for the algorithm and
+`pool_welford_results()` for combining parallel chunks.
+
+## Sanity Checks Before Any Optimization
+
+Never hand an untested evaluator to an optimizer: a bug found now costs
+seconds, the same bug found inside a calibration costs the whole run and,
+worse, may not look like a bug in the aggregated output. Three checks, in
+increasing order of strength.
+
+**Shape and plausibility.** Call it once and look:
+
+```{r sanity-shape}
+test <- gs_simulator(list(n_max = 220, t_interim = 0.5, c_eff = 2.0, c_fut = 0),
+                     fidelity = "low", seed = 1)
+round(test, 4)
+round(sqrt(attr(test, "variance")), 4)   # standard errors at the low tier
+```
+
+Named metrics, values in plausible ranges, variance and `n_rep` attributes
+present. Power around 0.87 and type I error around 0.025 for a 220-patient
+design with these boundaries is in the right neighborhood.
+
+**An analytically checkable corner.** The design family contains the
+classical fixed design as a degenerate case: with `t_interim = 1` the
+interim and final analyses coincide and the decision rule collapses to a
+single-look z test with critical value `c_eff` (the futility bound becomes
+unreachable). That corner has a textbook answer, so simulate it and
+compare against `power.prop.test()`:
+
+```{r sanity-corner}
+corner <- gs_simulator(list(n_max = 196, t_interim = 1, c_eff = qnorm(0.975),
+                            c_fut = -10),
+                       seed = 1, n_rep = 200000)
+round(corner, 4)
+power.prop.test(n = 98, p1 = 0.25, p2 = 0.45, sig.level = 0.025,
+                alternative = "one.sided")$power
+corner[["EN"]] == 196   # no early stopping possible, so EN must be exact
+```
+
+Simulated power 0.840 against the analytic approximation 0.841, type I
+error within Monte Carlo error of the nominal 0.025, and `EN` exactly
+equal to `n_max` because a one-look design cannot stop early. If any of
+these disagreed materially, the boundary logic or the test statistic would
+be wrong, and no amount of optimization downstream would be trustworthy.
+
+**Noise arithmetic.** The constraint thresholds have to be compared
+against the evaluator's precision. At the low tier (2,000 replicates), a
+type I error near 0.025 is estimated with standard error
+`sqrt(0.025 * 0.975 / 2000)`, about 0.0035, so single low-tier
+evaluations cannot distinguish 0.025 from 0.032:
+
+```{r sanity-noise}
+round(c(low_2000  = sqrt(0.025 * 0.975 / 2000),
+        med_4000  = sqrt(0.025 * 0.975 / 4000),
+        high_10k  = sqrt(0.025 * 0.975 / 10000),
+        check_200k = sqrt(0.025 * 0.975 / 200000)), 5)
+```
+
+Keep this table in mind: it explains most of what happens in the rest of
+this vignette. The type I error constraint sits within about one low-tier
+standard error of where the interesting designs live, which means observed
+feasibility during the search is a noisy signal, and verification at far
+higher replication is not optional.
+
+# A Quick Exploration Run
+
+The first calibration of a new problem should be sized to be thrown away:
+its job is to find the problems with the problem, not to produce the
+answer. The Quick profile (see the introduction vignette) is about
+`5 x d` initial points and `10-15 x d` total budget. We run it live here
+with a deliberately naive first guess at the bounds, including a `c_eff`
+floor of 1.90 chosen only because it "looked wide enough":
+
+```{r quick-run, message = FALSE}
+bounds_quick <- list(
+  n_max     = c(120, 200),
+  t_interim = c(0.25, 0.80),
+  c_eff     = c(1.90, 2.40),
+  c_fut     = c(-0.50, 1.00)
+)
+constraints <- list(power = c("ge", 0.85), type1 = c("le", 0.025))
+
+fit_quick <- bo_calibrate(
+  sim_fun = gs_simulator,
+  bounds = bounds_quick,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 20, q = 2, budget = 60, seed = 101,
+  fidelity_levels = c(low = 1000, med = 4000, high = 10000),
+  progress = FALSE
+)
+fit_quick$status
+round(unlist(fit_quick$best_theta), 3)
+fit_quick$best_objective
+sum(fit_quick$history$feasible)
+```
+
+The run converged by acquisition flatline after
+`r nrow(fit_quick$history)` of the 60 budgeted evaluations and reports a
+remarkably cheap best design: about `r round(fit_quick$best_theta$n_max)`
+patients with expected sample size around
+`r round(fit_quick$best_objective)`. Before celebrating, look at where the
+parameters landed. `c_eff` is sitting at
+`r round(fit_quick$best_theta$c_eff, 3)`, essentially on its lower bound
+of 1.90. A parameter pinned to a bound is always a finding: either the
+box is too small (the optimizer wants something outside it) or the
+constraint that should have stopped it did not bite. Re-checking the
+winner at 200,000 replicates settles which:
+
+```{r quick-recheck}
+recheck <- gs_simulator(fit_quick$best_theta, seed = 999, n_rep = 200000)
+round(recheck, 4)
+```
+
+The design that looked feasible during the search (observed power 0.875,
+observed type I error 0.024 at 1,000 replicates) actually has power
+`r round(recheck[["power"]], 3)` and type I error
+`r round(recheck[["type1"]], 4)`. Both constraints are violated, the
+type I error one badly. The mechanism is worth understanding because it is
+generic, not a quirk of this problem: at 1,000 replicates the type I error
+standard error is about 0.005, so among the many designs the search
+visited near the constraint boundary, some drew lucky Monte Carlo samples
+that understated their true error rate, and the optimizer, which is
+explicitly hunting for the cheapest design that looks feasible, is a
+machine for finding exactly those lucky draws. Optimization pressure turns
+noise into bias.
+
+The quick run has done its job, yielding three concrete adjustments:
+
+1. **Raise the `c_eff` floor to 1.96.** This one comes with an analytic
+   argument, not just an empirical one: a final critical value below
+   `qnorm(0.975) = 1.96` cannot control one-sided type I error at 0.025
+   even without an interim look, and adding an efficacy look only inflates
+   it further. Every design with `c_eff < 1.96` is infeasible by
+   construction, so the bound should exclude them and spend the budget
+   elsewhere.
+2. **Widen `n_max` upward.** The near-feasible mass piled up at the top of
+   the `n_max` range, and the high-fidelity recheck says true power there
+   is still short of 0.85. The feasible region evidently needs more
+   patients than the naive box allowed; the balanced run uses
+   `n_max` in [150, 280].
+3. **Use a less noisy low tier.** With the type I error constraint one
+   low-tier standard error from the action, 1,000-replicate evaluations
+   are too blunt. The balanced run doubles the low tier to 2,000
+   (standard error 0.0035) and keeps 10,000 for the high tier.
+
+The general lesson: read the quick run's output as diagnostics, not as an
+answer. Bound hits, near-boundary constraints, and a feasible fraction
+near zero are all instructions for the next run.
+
+# The Balanced Calibration Run
+
+The production run uses the corrected bounds, the Balanced profile
+(`n_init = 10 x d`, `budget` at the top of the `20-30 x d` range), the
+multi-seed verification gate, and the long-run controls (checkpointing and
+a walltime cap) that any run you care about should carry. This is the
+heavy stage, so it is precomputed; the chunk below is verbatim from the
+precompute script.
+
+```{r bounds-cal}
+bounds_cal <- list(
+  n_max     = c(150, 280),   # widened after the quick run
+  t_interim = c(0.25, 0.80),
+  c_eff     = c(1.96, 2.40), # floor raised to the single-look critical value
+  c_fut     = c(-0.50, 1.00)
+)
+constraints <- list(power = c("ge", 0.85), type1 = c("le", 0.025))
+```
+
+```{r balanced-run, eval = FALSE}
+ckpt_dir <- tempdir()
+
+fit_balanced <- bo_calibrate(
+  sim_fun = gs_simulator,
+  bounds = bounds_cal,
+  objective = "EN",
+  constraints = constraints,
+  n_init = 40, q = 2, budget = 140, seed = 2026,
+  fidelity_levels = c(low = 2000, med = 4000, high = 10000),
+  multi_seed_verify = TRUE, multi_seed_n = 5,
+  max_walltime_s = 4 * 3600,
+  checkpoint_fun = function(snap) {
+    saveRDS(snap, file.path(ckpt_dir, "balanced-checkpoint.rds"))
+  },
+  checkpoint_every = 5,
+  progress = FALSE
+)
+```
+
+```{r balanced-load}
+fit_balanced <- cs$balanced   # stored result of exactly the call above
+fit_balanced$status
+round(unlist(fit_balanced$best_theta), 3)
+fit_balanced$best_objective
+```
+
+## Reading the Run
+
+```{r balanced-history}
+nrow(fit_balanced$history)
+table(fit_balanced$history$fidelity)
+sum(fit_balanced$history$feasible)
+```
+
+Three observations, each worth a comment.
+
+First, the run stopped at `r nrow(fit_balanced$history)` of 140 budgeted
+evaluations with `status = "acq_flatline"`: the acquisition function
+collapsed because, given everything the surrogates had seen, no candidate
+offered meaningful expected improvement. That is a healthy ending, and on
+this problem it is also believable, because the four-dimensional space is
+smooth and the surrogates learn it quickly. Budget you did not need is
+budget saved.
+
+Second, every evaluation ran at the low tier. The adaptive fidelity
+selector promotes evaluations when higher replication buys information
+the search actually needs, and on this fast, smooth problem it decided
+low-tier information was sufficient throughout. This is a legitimate
+allocation, but it has a consequence you must not forget: nothing in the
+optimization history has been measured to better than a 0.0035 standard
+error on type I error, so the verification stage is carrying all of the
+high-precision burden. On harder problems, or with `fidelity_costs`
+reflecting a genuinely expensive high tier, you will see mixed
+allocations.
+
+Third, `r sum(fit_balanced$history$feasible)` of the evaluations were
+observed-feasible. The feasible region is a thin shell here (the
+constraints pin both power and type I error near their thresholds at the
+optimum), so most of the budget went to mapping the boundary, which is
+where the information about the constrained optimum lives.
+
+The incumbent trace shows the classic trajectory, big early gains and a
+long refinement tail:
+
+```{r incumbent-trace, fig.alt="Step plot of the best feasible expected sample size by BO iteration, dropping steeply in early iterations and flattening near 168"}
+h <- fit_balanced$history
+inc <- vapply(split(seq_len(nrow(h)), h$iter), function(ix) {
+  seen <- h[seq_len(max(ix)), ]
+  feas <- seen[seen$feasible, ]
+  if (nrow(feas) > 0) min(feas$objective) else NA_real_
+}, numeric(1))
+plot(as.integer(names(inc)), inc, type = "s", lwd = 2,
+     xlab = "BO iteration (0 = initial design)",
+     ylab = "Best feasible EN so far")
+```
+
+`check_convergence()` applies the improvement-stagnation test to any
+history, which is useful when you are deciding whether to extend a run or
+in multi-stage workflows:
+
+```{r check-convergence}
+check_convergence(fit_balanced$history, objective = "EN", patience = 5,
+                  improvement_threshold = 1e-3)
+```
+
+Note the two convergence lenses disagree slightly, and honestly: the
+improvement test says "not stagnant" because the incumbent still crept
+from 169.0 to 168.0 inside the last patience window, while the
+acquisition flatline that actually ended the run says "no candidate looks
+worth evaluating". Both are true. The acquisition view is forward-looking
+(the model believes remaining gains are below the noise floor); the
+improvement view is backward-looking. When they disagree in this
+direction, the run ended at the right time.
+
+With `ggplot2` installed, the two built-in pictures of the run show the
+geometry. The frontier plot makes the thin feasible shell visible, and the
+trade-off plot shows the optimizer pushing the low-EN designs toward, but
+not across, the constraint boundaries:
+
+```{r frontier, eval = has_ggplot2, fig.alt="Scatter plot of power against expected sample size for all evaluations, colored by feasibility; feasible points form a band above the power threshold"}
+plot_feasible_frontier(fit_balanced)
+```
+
+```{r tradeoff, eval = has_ggplot2, fig.alt="Scatter plot of power against type I error colored by expected sample size; cheap designs cluster near both constraint boundaries"}
+plot_tradeoff_surfaces(fit_balanced)
+```
+
+The best design itself: about
+`r round(fit_balanced$best_theta$n_max)` patients maximum, interim at
+`r round(100 * fit_balanced$best_theta$t_interim)`% of enrollment, final
+critical value `r round(fit_balanced$best_theta$c_eff, 3)` (a whisker
+above 1.96: the optimizer spent almost exactly the alpha the interim look
+freed up), and a mild futility bound at z =
+`r round(fit_balanced$best_theta$c_fut, 2)`. Expected sample size
+`r round(fit_balanced$best_objective, 1)` as observed during the search.
+Whether to believe those numbers is the next section's business.
+
+# The Trust Pipeline
+
+A calibrated design is a claim, not a fact. The claim was assembled from
+low-fidelity Monte Carlo estimates by a procedure that actively seeks
+favorable noise, so before anything is adopted it goes through three
+steps: the built-in multi-seed verification verdict, a manual
+high-replication re-check, and integer rounding with re-verification.
+
+## Step 1: The Multi-Seed Verdict
+
+Because the balanced run set `multi_seed_verify = TRUE`, BATON already
+re-evaluated the winning design at five independent seeds at the high
+tier (10,000 replicates each) and attached a verdict:
+
+```{r verdict}
+fit_balanced$verdict
+round(unlist(fit_balanced$multi_seed_summary[
+  c("n_seeds", "n_rep", "strict_feas_count", "power_mean", "power_sd",
+    "type1_mean", "type1_sd", "EN_mean", "EN_sd")]), 4)
+```
+
+The verdict is `MULTI_SEED_FAIL`: only
+`r fit_balanced$multi_seed_summary$strict_feas_count` of 5 verification
+seeds satisfied every constraint. The summary shows why. Across seeds,
+type I error averages `r round(fit_balanced$multi_seed_summary$type1_mean, 4)`
+(fine), but power averages
+`r round(fit_balanced$multi_seed_summary$power_mean, 4)`, about 0.2
+percentage points short of the 0.85 floor, with a cross-seed standard
+deviation of only
+`r round(fit_balanced$multi_seed_summary$power_sd, 4)`. That is not a
+fluke of one seed; the design's true power is just under the threshold.
+
+This outcome should be expected, not alarming, and it is worth being
+direct about why. The constrained optimum of this problem sits exactly on
+the power boundary (any power above 0.85 could be traded for fewer
+patients, so the optimizer walks downhill until the constraint is taut).
+A design whose true power is exactly 0.85 passes an all-seeds-strict
+verification only rarely, and low-fidelity selection bias (the same
+mechanism the quick run exposed) tends to leave the raw calibrated design
+a hair on the wrong side. The verdict did precisely its job: it stopped a
+marginally infeasible design from being adopted silently. What it costs
+to fix is the next step's question.
+
+## Step 2: Manual High-Fidelity Re-Check
+
+First, confirm the diagnosis at simulation ground truth. 200,000
+replicates give standard errors of about 0.0008 for power and 0.00035 for
+type I error:
+
+```{r manual-recheck}
+recheck_bal <- gs_simulator(fit_balanced$best_theta, seed = 4001,
+                            n_rep = 200000)
+round(recheck_bal, 4)
+```
+
+True power `r round(recheck_bal[["power"]], 4)`, true type I error
+`r round(recheck_bal[["type1"]], 4)`: the type I error constraint holds
+with a little room, the power constraint misses by about 0.3 percentage
+points. The remedy is to buy the missing power with the cheapest currency
+available. The sensitivity analysis in the next section will confirm this
+quantitatively, but the candidate is obvious: increase `n_max` slightly,
+holding the timing and boundaries at their calibrated values.
+
+## Step 3: Round to a Protocol Design and Re-Verify
+
+A protocol cannot enroll 202.8 patients. Rounding gives a maximum of 101
+per arm with the interim after 61 per arm; while we are at it, scan a few
+neighboring values of `n_max` at high replication to find the smallest
+design that clears the power floor with margin rather than by luck:
+
+```{r nmax-scan}
+theta_cal <- fit_balanced$best_theta
+scan <- do.call(rbind, lapply(seq(202, 222, by = 4), function(N) {
+  th <- theta_cal
+  th$n_max <- N
+  m <- gs_simulator(th, seed = 4002, n_rep = 200000)
+  data.frame(n_max = N, power = round(m[["power"]], 4),
+             type1 = round(m[["type1"]], 4), EN = round(m[["EN"]], 1))
+}))
+scan
+```
+
+The scan is monotone and quiet: each 4 added patients buys roughly half a
+percentage point of power at a cost of about 3 expected patients, and
+type I error drifts slightly downward (larger trials make the normal
+approximation of the test statistic better behaved). The 0.85 floor is
+first cleared at `n_max = 206`, but only by 0.3 percentage points, which
+is the kind of margin that future re-estimation or a slightly different
+simulation model could erase. We adopt `n_max = 210`, whose estimated
+power of 0.860 holds the floor with about one percentage point to spare.
+That choice is a judgement call, and it is worth making it explicitly and
+recording the rule: adopt the smallest design whose estimated power
+clears the constraint by more than what you consider erasable margin,
+here 0.005.
+
+The final protocol design, restated in enrollable integers:
+
+```{r final-design}
+theta_final <- theta_cal
+theta_final$n_max <- 210
+n_arm  <- 105                                     # per arm
+n1     <- round(theta_final$t_interim * n_arm)    # interim at 64 per arm
+c(n_arm = n_arm, interim_per_arm = n1,
+  realized_t = round(n1 / n_arm, 3),
+  interim_eff_bound = round(theta_final$c_eff / sqrt(n1 / n_arm), 3),
+  final_bound = round(theta_final$c_eff, 3),
+  futility_bound = round(theta_final$c_fut, 3))
+```
+
+And the re-verification, in the same spirit as the built-in gate: five
+fresh seeds, high replication, all constraints checked at each seed:
+
+```{r final-verify}
+verify <- do.call(rbind, lapply(1:5, function(s) {
+  m <- gs_simulator(theta_final, seed = 5000 + s, n_rep = 100000)
+  data.frame(seed = 5000 + s, power = round(m[["power"]], 4),
+             type1 = round(m[["type1"]], 4), EN = round(m[["EN"]], 1))
+}))
+verify
+all(verify$power >= 0.85 & verify$type1 <= 0.025)
+```
+
+Every seed passes, with power between
+`r min(verify$power)` and `r max(verify$power)` and type I error at most
+`r max(verify$type1)`. This design, `n_max = 210` with the calibrated
+timing and boundaries, is what goes in the protocol, and it is the design
+all remaining sections analyze.
+
+# Sensitivity Analysis
+
+The calibration found a point; sensitivity analysis maps the terrain
+around it, which is what turns an optimizer's output into design
+understanding. Three helpers, all driven by the fitted GP surrogates (no
+new simulation): global Sobol indices, local gradients at the optimum,
+and the covariance of local effects across the space. These were computed
+by the precompute script against the balanced fit's surrogates:
+
+```{r sens-code, eval = FALSE}
+set.seed(303)
+sens <- list(
+  sobol_EN    = sa_sobol(fit_balanced$surrogates, bounds_cal,
+                         outcome = "EN", n_mc = 4000),
+  sobol_power = sa_sobol(fit_balanced$surrogates, bounds_cal,
+                         outcome = "power", n_mc = 4000),
+  grad_EN     = sa_gradients(fit_balanced$surrogates, fit_balanced$best_theta,
+                             bounds_cal, outcome = "EN"),
+  grad_power  = sa_gradients(fit_balanced$surrogates, fit_balanced$best_theta,
+                             bounds_cal, outcome = "power"),
+  cov_EN      = cov_effects(fit_balanced$surrogates, bounds_cal,
+                            outcome = "EN", n_mc = 500)
+)
+```
+
+(One storage note, because it affects how you run this yourself: a fit
+saved with `slim = TRUE`, or stripped of its `surrogates` for compact
+storage as this vignette's precompute script does, cannot feed these
+functions. Compute sensitivity while the full fit is in memory, or store
+the full fit. The script computes the tables first and strips afterward.)
+
+## What Matters Globally
+
+```{r sobol}
+cs$sens$sobol_EN
+cs$sens$sobol_power
+```
+
+```{r sobol-plot, eval = has_ggplot2, fig.alt="Bar chart of first-order Sobol indices for expected sample size; n_max dominates with an index near 0.85"}
+plot_sobol_indices(cs$sens$sobol_EN)
+```
+
+The Sobol indices give first-order fractions of variance across the whole
+box. For `EN`, `n_max` explains about 85% of the variance and
+`t_interim` about 6%, with the boundary parameters contributing almost
+nothing; averaged over the design space, expected sample size is mostly
+just trial size. For `power` the picture is similar but with `c_eff`
+taking a real share (about 18%): where you set the final critical value
+matters for power, but which z-score triggers futility barely does within
+this box. Note what the near-zero `c_fut` indices do and do not say: they
+say EN under the alternative and power are insensitive to the futility
+bound in this range (futility stops are rare when the treatment works);
+they say nothing about EN under the null, which is where futility earns
+its keep and which this calibration did not target.
+
+## What Matters at the Optimum
+
+```{r gradients}
+cs$sens$grad_EN
+cs$sens$grad_power
+```
+
+Local gradients answer the design-negotiation questions that always come
+after calibration. Reading the point estimates (the `sd` column here is
+very conservative: it treats the two finite-difference endpoints as
+independent posterior draws, so treat magnitudes and signs qualitatively):
+
+- `dEN/dn_max` is about 0.79: each patient added to the cap adds about
+  0.8 expected patients, because most trials run past the interim. This
+  is the price of the power margin bought in the trust pipeline (8 extra
+  `n_max` cost about 5 expected patients, exactly what the scan showed).
+- `dpower/dt_interim` is about 0.05 per unit of `t_interim`, so moving
+  the interim look by 5% of enrollment changes power by roughly 0.003,
+  within Monte Carlo noise. Power is locally flat in interim timing:
+  **operational flexibility exists**. If site logistics need the interim
+  a few weeks earlier or later than the 61% point, the power case does
+  not move. The `EN` gradient in `t_interim` is larger (about -44 per
+  unit, or 2 expected patients per 5% shift), so timing is an efficiency
+  question, not a validity question.
+- `dpower/dc_eff` is about -0.16: raising the final critical value by
+  0.1 costs 1.6 percentage points of power. Together with the near-zero
+  Sobol index of `c_fut`, this confirms the efficacy boundary is the
+  load-bearing decision threshold and the futility bound is, for these
+  operating characteristics, close to a free parameter.
+
+## How Effects Covary
+
+```{r cov-effects}
+round(cs$sens$cov_EN, 1)
+```
+
+```{r cov-plot, eval = has_ggplot2, fig.alt="Heatmap of the covariance matrix of local EN gradients; the t_interim diagonal entry dominates and t_interim covaries negatively with c_eff"}
+plot_case_covariance(cs$sens$cov_EN)
+```
+
+`cov_effects()` samples local gradients of `EN` at 500 random points and
+reports their covariance: it measures how much each parameter's effect
+varies across the space, and which effects move together. The dominant
+entry is the `t_interim` variance (about 5,200): the effect of interim
+timing on `EN` changes sign and magnitude dramatically depending on where
+you are, which is why the global Sobol index for `t_interim` is small
+even though its local gradient at the optimum is not. The negative
+`t_interim`-`c_eff` covariance says those two interact: with a stricter
+final boundary, delaying the interim has a different EN consequence than
+with a lax one. The practical reading: statements about interim timing
+are only meaningful jointly with the boundary choice, so if the boundary
+is renegotiated late (a regulator preferring a more conservative shape,
+say), the timing should be re-examined too rather than carried over.
+
+# Benchmarking the Calibration Method
+
+Was Bayesian optimization worth the machinery on this problem?
+`benchmark_methods()` runs the same calibration with competing strategies
+under a common evaluation harness. Here BO (3 replicate runs at the
+balanced settings) is compared against random search (3 runs of 100
+LHS-sampled designs, each evaluated at the high tier) and a grid (3
+points per axis, 81 designs at the high tier). Precomputed:
+
+```{r bench-code, eval = FALSE}
+bench <- benchmark_methods(
+  sim_fun = gs_simulator,
+  bounds = bounds_cal,
+  objective = "EN",
+  constraints = constraints,
+  strategies = c("bo", "random", "grid"),
+  bo_args = list(n_init = 40, q = 2, budget = 140, seeds = 1:3,
+                 fidelity_levels = c(low = 2000, med = 4000, high = 10000),
+                 slim = TRUE),
+  random_args = list(n_samples = 100, seeds = 1:3),
+  grid_args = list(resolution = 3),
+  progress = FALSE
+)
+bench_summary <- summarise_benchmark(bench)
+```
+
+```{r bench-summary}
+as.data.frame(cs$bench_summary[, c("strategy", "runs", "feasible_rate",
+                                   "objective_mean", "objective_sd",
+                                   "sims_mean")])
+```
+
+```{r bench-plot, eval = has_ggplot2, fig.alt="Scatter plot of mean best objective against mean simulation replicates per strategy; BO sits in the low-cost low-EN corner"}
+plot_benchmark_efficiency(cs$bench)
+```
+
+What the data actually show, including the caveats:
+
+- **BO wins on both axes here.** Mean best feasible `EN` of about
+  `r round(cs$bench_summary$objective_mean[cs$bench_summary$strategy == "bo"])`
+  using about
+  `r round(cs$bench_summary$sims_mean[cs$bench_summary$strategy == "bo"] / 1000)`k
+  simulator replicates per run, against about
+  `r round(cs$bench_summary$objective_mean[cs$bench_summary$strategy == "random"])`
+  for random search at 1,000k replicates and
+  `r round(cs$bench_summary$objective_mean[cs$bench_summary$strategy == "grid"])`
+  for the grid at 810k. Random search with roughly eight times the
+  simulation budget lands about 24 expected patients worse; the coarse
+  grid is not competitive, and a grid fine enough to be competitive in
+  four dimensions would need orders of magnitude more points.
+- **The comparison is not entirely apples to apples, in a direction that
+  flatters BO.** The baselines evaluated every design at 10,000
+  replicates, so their observed-best values are solid, while BO's
+  observed best comes from 2,000-replicate evaluations and is
+  optimistically biased by the selection effect this vignette keeps
+  running into (the trust pipeline showed the raw BO winner really sits
+  at the boundary). The honest headline is not "BO finds EN 167 and
+  random finds 190"; it is "after verification and margin, BO's design
+  costs about 174 expected patients, still roughly 11-16 patients better
+  than the best unverified random-search design, on an eighth of the
+  simulation budget".
+- **The variance column matters.** Random search's best-found value
+  swings by 11 patients across seeds; BO's spread is 2.5. Reproducibility
+  of the answer across reruns is itself a benefit.
+
+# Constraint Reliability Across Seeds
+
+The benchmark asked how good the answers look; the reliability study asks
+whether they are true. `estimate_constraint_reliability()` repeats the
+whole calibration across seeds and validates each winning design at
+200,000 replicates, recording how often the calibrated design actually
+satisfies its constraints:
+
+```{r rel-code, eval = FALSE}
+rel <- estimate_constraint_reliability(
+  sim_fun = gs_simulator,
+  bounds = bounds_cal,
+  objective = "EN",
+  constraints = constraints,
+  strategies = c("bo", "random"),
+  calibration_seeds = 1:5,
+  validation_reps = 200000,
+  bo_args = list(n_init = 20, q = 2, budget = 60,
+                 fidelity_levels = c(low = 2000, med = 4000, high = 10000),
+                 slim = TRUE),
+  random_args = list(n_samples = 60),
+  progress = FALSE
+)
+```
+
+```{r rel-summary}
+as.data.frame(cs$rel$summary)
+as.data.frame(cs$rel$runs[, c("strategy", "run_id", "calibration_feasible",
+                              "validation_feasible", "validation_objective")])
+```
+
+```{r rel-plot, eval = has_ggplot2, fig.alt="Bar chart of validation feasibility rates; random search at 100 percent, Bayesian optimization at 0 percent"}
+plot_constraint_reliability(cs$rel)
+```
+
+This is the most instructive table in the vignette, and it deserves a
+completely honest reading, because at first glance it looks like an
+indictment of BO. Every one of the five BO calibrations produced a design
+that was observed-feasible during calibration and **failed** validation at
+200,000 replicates; every random-search design validated cleanly. The
+resolution of the apparent paradox is in the objective column: the BO
+designs that "fail" have validated `EN` around
+`r round(cs$rel$summary$objective_mean[cs$rel$summary$strategy == "bo"])`
+and are failing because their true power is a fraction of a percentage
+point under 0.85, exactly like the balanced run's raw winner. The random
+designs "pass" because random search almost never lands within a hair of
+the constraint boundary; its winners sit comfortably inside the feasible
+region, about
+`r round(cs$rel$summary$objective_mean[cs$rel$summary$strategy == "random"] - cs$rel$summary$objective_mean[cs$rel$summary$strategy == "bo"])`
+expected patients more expensive.
+
+So the reliability study is not measuring "which method is right"; it is
+measuring distance-to-boundary, and it quantifies a structural fact about
+constrained calibration under noise: **an effective optimizer will ride
+the constraint boundary, and boundary-riding designs will not validate
+strictly without an explicit margin.** That is why the trust pipeline is
+a pipeline: verdict, re-check, margin, re-verify. The 0% raw reliability
+here is precisely the failure the margin step (adopting `n_max = 210`
+over 202) repaired, at a verified cost of about 5 expected patients. If
+you want raw calibrations to validate more often without a manual margin
+step, calibrate against buffered thresholds (for example, power at least
+0.86 against a protocol floor of 0.85) and verify against the protocol
+values; the buffer plays the same role as the margin, chosen in advance.
+
+# Calibrating a Family of Designs: Philosophies
+
+A single constraint set is one philosophy about the trial. Stakeholder
+discussions usually involve several: a sponsor pushing for the smallest
+viable trial, a statistician defending power, a safety board wanting
+conservatism. `bo_calibrate_philosophies()` calibrates a named family of
+objective/constraint sets in one batch, ordering them so that designated
+donor philosophies run first and later ones warm-start from the donors'
+calibrated designs, with the multi-seed gate applied to every member.
+Here the `balanced` philosophy (the one calibrated above) acts as donor,
+and a `conservative` (power at least 0.90) and an `aggressive` (power at
+least 0.80) variant warm-start from it:
+
+```{r phil-code, eval = FALSE}
+philosophies <- list(
+  balanced     = list(objective = "EN",
+                      constraints = list(power = c("ge", 0.85),
+                                         type1 = c("le", 0.025))),
+  conservative = list(objective = "EN",
+                      constraints = list(power = c("ge", 0.90),
+                                         type1 = c("le", 0.025))),
+  aggressive   = list(objective = "EN",
+                      constraints = list(power = c("ge", 0.80),
+                                         type1 = c("le", 0.025)))
+)
+
+phil <- bo_calibrate_philosophies(
+  scenario_id = "resp2arm",
+  sim_fun = gs_simulator,
+  bounds = bounds_cal,
+  philosophies = philosophies,
+  multi_seed_verify = TRUE, multi_seed_n = 5, multi_seed_strict = FALSE,
+  n_init = 30, q = 2, budget = 100, seed = 11,
+  fidelity_levels = c(low = 2000, med = 4000, high = 10000),
+  slim = TRUE, progress = FALSE
+)
+```
+
+The batch returns a manifest recording the dependency roles, warm-start
+donors, verdicts, and runtimes:
+
+```{r phil-manifest}
+cs$phil_manifest[, c("philosophy", "dependency_role", "verdict",
+                     "objective_value", "warmstart_donors")]
+```
+
+And the per-philosophy designs with their multi-seed-verified operating
+characteristics (assembled by the precompute script from each fit's
+`multi_seed_summary`):
+
+```{r phil-table}
+cs$phil_table
+```
+
+Reading the family honestly:
+
+- **The power ladder has a visible price.** Verified expected sample size
+  runs about 150 (aggressive, power 0.82) to 165 (balanced, power 0.85)
+  to 188 (conservative, power 0.90): each 5 percentage points of power
+  costs roughly 15 to 23 expected patients in this scenario. Putting that
+  table in front of stakeholders is usually worth more than any single
+  calibrated design, because it converts a philosophical argument into a
+  priced menu.
+- **Every verdict is a warning, and correctly so.** All three designs
+  ride their respective constraint boundaries, and the verified operating
+  characteristics show the same marginal violations the balanced run
+  exhibited (type I error a shade over 0.025 for the two philosophies
+  whose `c_eff` landed on the 1.96 floor; conservative's power a shade
+  under 0.90). With `multi_seed_strict = FALSE` these surface as
+  `MULTI_SEED_WARN` rather than `FAIL`, which keeps the donor usable for
+  warm-starting while still flagging every member for the same
+  margin-and-re-verify treatment Section
+  "The Trust Pipeline" applied to the balanced design. With the default
+  `multi_seed_strict = TRUE`, a failed donor is excluded from
+  warm-starting recipients, a conservatism you want when a donor might
+  be genuinely broken rather than marginally boundary-riding.
+- **Warm-starting is about economy.** The manifest shows both recipients
+  seeded from `balanced`; each recipient's search starts from a
+  known-good region of a closely related problem rather than from
+  scratch. On this toy problem the savings are seconds; on a
+  patient-level simulator, donors can save a recipient a large fraction
+  of its budget, and the dependency ordering (donors first) is exactly
+  the workflow for calibrating a protocol's design family overnight.
+
+Use this tool when the deliverable is a family (a design options table
+for a protocol meeting, a sensitivity-of-design-to-philosophy appendix),
+not just one design. For cross-scenario warm-starting and the donor
+mechanics in more depth, see `vignette("v04-hardening")`.
+
+# Hygiene for Long Runs
+
+Everything in this case study ran in seconds because the simulator is a
+toy. The workflow is designed for the real case, where a single balanced
+calibration is an overnight job, and the balanced run above already
+demonstrated the pattern to copy:
+
+- **Checkpointing**: `checkpoint_fun` receives a slim, resumable snapshot
+  every `checkpoint_every` iterations. If the job dies, resume by feeding
+  the checkpoint's history back in:
+
+```{r resume-pattern, eval = FALSE}
+ck <- readRDS(file.path(ckpt_dir, "balanced-checkpoint.rds"))
+fit_resumed <- bo_calibrate(
+  sim_fun = gs_simulator, bounds = bounds_cal, objective = "EN",
+  constraints = constraints,
+  initial_history = ck$history,
+  n_init = nrow(ck$history), budget = 140, seed = 2027,
+  fidelity_levels = c(low = 2000, med = 4000, high = 10000)
+)
+```
+
+- **Walltime capping**: `max_walltime_s = 4 * 3600` makes the run stop
+  gracefully (with `status = "walltime"` and a usable partial fit) before
+  a scheduler kills it ungracefully. Pair it with
+  `on_error = "return_partial"` on flaky infrastructure so a single
+  failed simulator call costs one evaluation, not the run.
+- **`slim = TRUE`** returns a lightweight fit without surrogates and
+  diagnostics, skipping the final surrogate refit. The precompute script
+  uses it for every fit whose surrogates nothing downstream needs (the
+  benchmark, reliability, and philosophy sub-runs), but deliberately
+  **not** for the balanced fit, because Section "Sensitivity Analysis"
+  needs the surrogates; there the script computes the sensitivity tables
+  first and strips the fit before saving. Decide `slim` by asking what
+  will consume the fit.
+- **Batch parallelism**: with `q > 1`, setting `options(BATON.cores = k)`
+  evaluates the points within each batch in parallel on Unix/macOS. This
+  multiplies with any parallelism inside your evaluator (see
+  `pool_welford_results()` in the introduction vignette), so budget cores
+  across the two levels deliberately.
+
+# The Payoff
+
+The naive alternative to all of the above is the fixed design: no interim
+look, sample size straight from `power.prop.test()`. That needs 101 per
+arm (202 patients total), every one of them enrolled every time. Its
+operating characteristics under the same simulation model, and the final
+calibrated design's, computed live:
+
+```{r payoff}
+n_fixed <- 2 * ceiling(power.prop.test(power = 0.85, p1 = 0.25, p2 = 0.45,
+                                       sig.level = 0.025,
+                                       alternative = "one.sided")$n)
+fixed_oc <- gs_simulator(list(n_max = n_fixed, t_interim = 1,
+                              c_eff = qnorm(0.975), c_fut = -10),
+                         seed = 4003, n_rep = 200000)
+final_oc <- gs_simulator(theta_final, seed = 4004, n_rep = 200000)
+
+summary_tbl <- data.frame(
+  design = c("Naive fixed", "Calibrated GS (verified)"),
+  n_max = c(n_fixed, 210),
+  power = round(c(fixed_oc[["power"]], final_oc[["power"]]), 3),
+  type1 = round(c(fixed_oc[["type1"]], final_oc[["type1"]]), 4),
+  EN = round(c(fixed_oc[["EN"]], final_oc[["EN"]]), 1)
+)
+summary_tbl
+```
+
+The calibrated group-sequential design holds both constraints with
+verified margin and saves about
+`r round(fixed_oc[["EN"]] - final_oc[["EN"]])` patients in expectation
+under the alternative, a
+`r round(100 * (fixed_oc[["EN"]] - final_oc[["EN"]]) / fixed_oc[["EN"]])`%
+reduction, in exchange for a maximum enrollment 8 patients higher than
+the fixed trial's if the interim does not stop. The mechanics of the
+saving are transparent: about
+`r round(100 * (210 - final_oc[["EN"]]) / (210 - 2 * 64))`% of trials
+under the alternative stop at the interim with 128 patients enrolled,
+almost all of them for efficacy. If the treatment works, roughly four
+trials in nine finish 82 patients early with the answer in hand.
+
+Just as important is what the calibration did *not* cost. The
+calibration path itself (the quick run, the balanced run, and the
+built-in verification gate) consumed about 220,000 simulated trials per
+hypothesis, and the high-precision trust-pipeline checks (the 200,000-rep
+re-checks, the `n_max` scan, and the final five-seed verification) added
+roughly another 2.3 million. The benchmark and reliability studies cost
+millions more, but those are method-evaluation overhead for this
+vignette, not something a practitioner runs for each design. Even the
+everything-included total is far below what a competitive grid would
+spend on one constraint set: 10 points per axis in four dimensions at
+10,000 replicates is 100 million trials per hypothesis, and the grid
+still could not resolve the constraint boundary this problem's optimum
+sits on.
+
+The pattern of this case study transfers directly to expensive
+simulators; only the evaluator's body and the wall-clock scale change.
+Quick run to debug the problem statement, balanced run with verification
+to get a candidate, trust pipeline to make it adoptable, sensitivity to
+understand it, and the batch tools when the deliverable is a family of
+designs rather than a point.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,934 @@
+---
+title: "How BATON Works: Methods and Implementation"
+author: "BATON Package Authors"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{How BATON Works: Methods and Implementation}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4.5
+)
+# Suppress the one-time q-default migration note so chunk output stays clean.
+options(BATON.q_warning_shown = TRUE)
+set.seed(2026)
+has_ggplot2 <- requireNamespace("ggplot2", quietly = TRUE)
+```
+
+```{r load}
+library(BATON)
+```
+
+This vignette explains the statistical machinery inside `bo_calibrate()` and
+how the implementation realizes it. It is written for readers who want to
+understand what the package actually computes: which model is fit to the
+simulation output, what the acquisition function rewards, how the
+multi-fidelity budget is spent, and which implementation details (seeding,
+deduplication, parallelism) matter for reproducibility. The presentation is
+prose-first with a small number of key formulas, in the spirit of the
+methods vignettes accompanying the `hetGP` and `DiceOptim` packages.
+
+The methodology is developed in full in the companion manuscript (Young et
+al., submitted; see the Citing section at the end). Everything below is
+paraphrased from that manuscript and its supplement, checked line by line
+against the package source, and where the two differ the description here
+follows the code. Small runnable demonstrations are interleaved so the
+abstractions stay concrete; each runs in a few seconds with fixed seeds.
+
+For a task-oriented introduction (how to write a simulator, how to call
+`bo_calibrate()`, how to read the results), start instead with
+`vignette("BATON-introduction", package = "BATON")`.
+
+# 1. The calibration problem
+
+An adaptive trial design is parameterized by a vector
+$\boldsymbol{\theta} \in \Theta \subset \mathbb{R}^d$ of calibration inputs:
+sample size caps, decision thresholds, interim timing, prior
+hyperparameters, and so on. For each design, the operating characteristics
+(power, type I error, expected enrollment, expected duration) have no
+closed form; they can only be estimated by simulating $R$ complete trials
+and averaging. Write $\psi_m^*(\boldsymbol{\theta})$ for the true value of
+the $m$-th operating characteristic and
+$\hat{\psi}_m(\boldsymbol{\theta}; R)$ for its Monte Carlo estimate.
+
+The calibration task BATON solves is a constrained minimization of one
+operating characteristic subject to bounds on others:
+
+$$
+\min_{\boldsymbol{\theta} \in \Theta}\; \psi_0^*(\boldsymbol{\theta})
+\qquad \text{subject to} \qquad
+\psi_j^*(\boldsymbol{\theta}) \;\ge\; t_j
+\;\;\text{or}\;\;
+\psi_j^*(\boldsymbol{\theta}) \;\le\; t_j,
+\qquad j = 1, \ldots, J,
+$$
+
+where $\Theta$ is a box (each parameter has a lower and upper bound, the
+`bounds` argument), the objective $\psi_0$ is named by the `objective`
+argument, and each constraint is a metric name with a direction (`"ge"` or
+`"le"`) and a threshold (the `constraints` argument). A typical instance:
+minimize expected enrollment subject to power $\ge 0.80$ and type I error
+$\le 0.10$.
+
+Four features distinguish this from textbook Bayesian optimization, and
+each drives a design decision described in the sections that follow.
+
+1. **The objective and the constraints are all noisy.** Every evaluation
+   returns Monte Carlo estimates, $\hat{\psi}_m = \psi_m^* +
+   \varepsilon_m$, with mean-zero error whose variance shrinks like $1/R$.
+   A feasibility decision based on a noisy estimate can be wrong, so the
+   search has to reason probabilistically about constraint satisfaction
+   (Section 3).
+
+2. **The noise is heteroskedastic and its variance is estimable.** For a
+   proportion-valued metric estimated from $R$ replicates, the Monte Carlo
+   variance is approximately $\hat{p}(1-\hat{p})/R$: near zero when the
+   metric is near 0 or 1, maximal at 0.5. The simulator sees its own
+   replicates, so it can hand BATON a per-evaluation variance estimate,
+   and the surrogate model can use it (Section 2).
+
+3. **Evaluations are expensive and batchable.** Simulating thousands of
+   trials per design point dominates the cost of everything else, so the
+   method budget is counted in simulator evaluations, points can be
+   proposed in batches of `q` and evaluated in parallel, and the
+   acquisition machinery must keep batch members from collapsing onto the
+   same location (Section 3).
+
+4. **Fidelity is a dial.** The same simulator run at $R = 200$ or $R =
+   10{,}000$ replications answers the same question at different precision
+   and cost. BATON treats the replication count as a decision variable
+   (Section 4).
+
+# 2. Gaussian process surrogates under Monte Carlo noise
+
+## One independent GP per metric
+
+`fit_surrogates()` fits one Gaussian process per modeled metric: the
+objective plus every metric that appears in a constraint. The surrogates
+are statistically independent of one another; no cross-metric covariance
+is modeled. Joint feasibility probabilities are therefore products of
+per-constraint marginals (Section 3), an approximation the manuscript
+supports empirically for its application (constraint estimates come from
+separate simulation scenarios, and observed posterior rank correlations
+were small).
+
+Each GP is fit on the unit hypercube: all parameters are rescaled to
+$[0,1]$ internally (Section 6), so lengthscales are comparable across
+dimensions and kernel defaults behave predictably.
+
+## Heteroskedastic versus homoskedastic fits, and how BATON chooses
+
+The Monte Carlo noise variance
+$\mathrm{Var}(\hat{\psi}_m(\boldsymbol{\theta}; R)) =
+\tau_m^2(\boldsymbol{\theta})/R$ depends on the input (through
+$\tau_m^2$) and on the fidelity (through $R$). A homoskedastic surrogate
+that assumes one common noise level will be overconfident exactly where
+precision matters most, near constraint boundaries where proportion
+metrics sit in their high-variance mid-range. BATON therefore prefers
+noise-aware fits, with a graceful degradation chain. The selection logic
+in `fit_surrogates()` is, per metric:
+
+1. **hetGP path.** If the history contains *replicated designs* (the same
+   $\boldsymbol{\theta}$ evaluated more than once, detected via the
+   `theta_id` hash) *and* variance information is present, the metric is
+   fit with `hetGP::mleHetGP()`. The replicate structure is passed
+   directly (each observation is one row, with duplicated design
+   locations), and hetGP estimates an input-dependent noise surface
+   jointly with the mean surface, following Binois, Gramacy, and Ludkovski
+   (2018). A small fixed nugget ($10^{-8}$) is added for numerical
+   conditioning.
+2. **DiceKriging path with known noise.** Without replicated designs (the
+   common case mid-run, since duplicate proposals are rare in a continuous
+   space), the metric is fit with `DiceKriging::km()` on the aggregated
+   observations, passing the simulator-supplied Monte Carlo variances as
+   the known per-observation noise (`noise.var`). This is still a
+   heteroskedastic model in the sense that matters: each observation
+   carries its own noise variance, so a high-fidelity evaluation is
+   trusted more than a low-fidelity one at the fitting stage. Missing
+   variances within a metric are imputed with the *largest* observed
+   noise for that metric (an unknown-variance observation should be
+   trusted least, not most).
+3. **Homoskedastic nugget fallback.** If no variance information exists at
+   all for a metric, `km()` is fit with a small fixed nugget
+   ($10^{-6}$) instead, and a one-time message suggests attaching
+   variance attributes to the simulator output.
+4. **Constant predictor.** If every fitting attempt fails (which the
+   hetGP path additionally guards with an `mleHomGP` retry and a `km`
+   retry), the metric falls back to a constant predictor: the sample mean
+   with a deliberately large predictive standard deviation (1.0), so the
+   acquisition function treats the metric as unknown and keeps exploring
+   rather than crashing the run.
+
+The practical takeaway for simulator authors: attach
+`attr(metrics, "variance")` (and `attr(metrics, "n_rep")`) to your
+simulator's return value. If you do not, BATON falls back to a binomial
+variance approximation $\hat{p}(1-\hat{p})/R$ for metrics that lie in
+$[0,1]$ and to the homoskedastic nugget for everything else
+(`default_variance_estimator()`), which is workable but weaker than a
+proper replicate-based estimate.
+
+## Aggregation of replicated designs
+
+Evaluations sharing a `theta_id` (the same design up to a $10^{-6}$
+rounding in unit coordinates, Section 6) are grouped before fitting. On
+the DiceKriging path the grouped observations are averaged per metric
+with NA-aware means, and their noise variances are averaged the same way,
+so re-evaluating a promising design at higher fidelity sharpens the
+surrogate there instead of creating a numerically degenerate duplicate
+row. On the hetGP path replicates are passed through unaggregated, which
+is precisely the structure hetGP exploits to separate signal variance
+from noise variance.
+
+## Estimating the variances: Welford and pooling
+
+The per-evaluation variance estimates are the simulator author's
+responsibility, and the package ships helpers that make this cheap:
+`welford_mean_var()` computes means and variances in one streaming pass
+over replicates (constant memory), and `pool_welford_results()` combines
+chunked or parallel runs exactly. See
+`vignette("variance-estimation", package = "BATON")` for the details and
+worked examples.
+
+## Kernel choice
+
+The default covariance kernel is Matern 5/2 (`covtype = "matern5_2"`,
+mapped to `Matern5_2` on the hetGP path), with automatic relevance
+determination: one lengthscale per input dimension. Matern 5/2 sample
+paths are twice differentiable, which matches the moderate smoothness of
+simulated operating-characteristic surfaces better than the infinitely
+smooth squared-exponential kernel, while remaining smooth enough for
+stable maximum-likelihood fitting. This is the DiceKriging default and is
+set explicitly for hetGP (whose own default is squared-exponential).
+
+## Warm-starting fits across iterations
+
+Surrogates are refit from scratch every BO iteration as the history
+grows. To cut the cost of hyperparameter optimization,
+`fit_surrogates()` accepts the previous iteration's fitted models and
+extracts their lengthscales (`extract_gp_hyperparams()`: the
+`range.val` slot of a `km` object, the `$theta` element of a hetGP or
+homGP object). On the DiceKriging path these are passed as `parinit`,
+the starting point for `km()`'s likelihood optimization, whenever they
+form a valid positive vector of the right dimension; otherwise the fit
+cold-starts. The hetGP path does not currently consume the previous
+hyperparameters; its fits use hetGP's own initialization. Warm-starting
+changes only the optimizer's starting point, not the model class, so it
+trades a modest reduction in fitting time for no change in what is being
+estimated. If a warm-started fit errors, `bo_calibrate()` retries the
+iteration's fits without warm-start before giving up.
+
+## Demonstration: what a surrogate is
+
+The following builds a small history by hand (twelve noisy evaluations of
+a one-dimensional function, each an average of 200 replicates with known
+Monte Carlo variance), fits a surrogate through the exported
+`fit_surrogates()`, and plots the GP mean and a two-standard-deviation
+band against the truth. This is exactly the model `bo_calibrate()` fits
+per metric; here the variance information routes the fit to the
+DiceKriging known-noise path because no design is replicated.
+
+```{r demo-gp-fit}
+set.seed(101)
+f_true <- function(x) sin(6 * x) + 0.6 * x
+
+n_pts   <- 12
+x_obs   <- seq(0.03, 0.97, length.out = n_pts)
+R_reps  <- 200
+sd_rep  <- 0.5   # per-replicate noise SD
+y_obs   <- vapply(x_obs,
+                  function(xi) mean(rnorm(R_reps, f_true(xi), sd_rep)),
+                  numeric(1))
+v_obs   <- rep(sd_rep^2 / R_reps, n_pts)   # known Monte Carlo variance
+
+demo_history <- tibble::tibble(
+  unit_x   = lapply(x_obs, function(xi) c(x = xi)),
+  theta_id = vapply(x_obs, function(xi) BATON:::theta_to_id(c(x = xi)),
+                    character(1)),
+  metrics  = lapply(y_obs, function(yi) c(f = yi)),
+  variance = lapply(v_obs, function(vi) c(f = vi))
+)
+
+no_constraints <- BATON:::parse_constraints(list())
+sur <- fit_surrogates(demo_history, objective = "f",
+                      constraint_tbl = no_constraints)
+class(sur$f)   # DiceKriging km fit with per-point noise variances
+```
+
+```{r demo-gp-predict}
+x_grid <- matrix(seq(0, 1, length.out = 201), ncol = 1,
+                 dimnames = list(NULL, "x"))
+pred <- BATON:::predict_surrogates(sur, x_grid)
+gp_mean <- pred$f$mean
+gp_sd   <- pred$f$sd
+```
+
+```{r demo-gp-plot, eval = has_ggplot2, fig.alt = "GP posterior mean with a two standard deviation band, the true function, and the noisy observations"}
+library(ggplot2)
+df_grid <- data.frame(x = x_grid[, "x"], mean = gp_mean, sd = gp_sd,
+                      truth = f_true(x_grid[, "x"]))
+df_obs  <- data.frame(x = x_obs, y = y_obs)
+ggplot(df_grid, aes(x = x)) +
+  geom_ribbon(aes(ymin = mean - 2 * sd, ymax = mean + 2 * sd),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = mean, linetype = "GP posterior mean"),
+            color = "steelblue", linewidth = 0.9) +
+  geom_line(aes(y = truth, linetype = "true function"), color = "black") +
+  geom_point(data = df_obs, aes(y = y), size = 2) +
+  scale_linetype_manual(NULL, values = c("GP posterior mean" = "solid",
+                                         "true function" = "dashed")) +
+  labs(x = "design parameter (unit scale)", y = "metric value",
+       title = "A surrogate: GP mean and 2-sd band over noisy evaluations") +
+  theme_minimal()
+```
+
+The band is the model's honest report of what it does not know: wide
+between observations, and never collapsing to zero at the observations
+themselves because each carries known Monte Carlo noise. Everything the
+acquisition function does in the next section is a computation on this
+mean and this band.
+
+# 3. Acquisition: expected constrained improvement
+
+## Expected improvement
+
+Given the objective surrogate's posterior mean $\mu_0(\boldsymbol{\theta})$
+and standard deviation $\sigma_0(\boldsymbol{\theta})$, and an incumbent
+value $f^*$ (the best feasible objective known so far; BATON minimizes),
+expected improvement (Jones, Schonlau, and Welch 1998) is
+
+$$
+\mathrm{EI}(\boldsymbol{\theta})
+= \mathbb{E}\!\left[\max\{0,\; f^* - f(\boldsymbol{\theta})\}\right]
+= \left(f^* - \mu_0\right)\Phi(z) + \sigma_0\,\phi(z),
+\qquad
+z = \frac{f^* - \mu_0}{\sigma_0},
+$$
+
+with $\Phi$ and $\phi$ the standard normal CDF and density. It is large
+where the mean is already better than the incumbent, and it stays
+positive where the mean is worse but the uncertainty leaves room for a
+pleasant surprise. The implementation (`compute_ei()`, internal) adds an
+epsilon guard of $10^{-10}$ to the standard deviation and handles the
+degenerate $\sigma_0 \approx 0$ case as $\max\{0, f^* - \mu_0\}$.
+
+## Feasibility probability
+
+Because each constraint has its own independent GP, the probability that
+constraint $j$ holds at $\boldsymbol{\theta}$ is a univariate Gaussian
+tail probability,
+
+$$
+\pi_j(\boldsymbol{\theta}) =
+\Phi\!\left(\frac{\mu_j(\boldsymbol{\theta}) - t_j}
+{\sigma_j(\boldsymbol{\theta})}\right)
+\;\;\text{for a "ge" constraint},
+\qquad
+\Phi\!\left(\frac{t_j - \mu_j(\boldsymbol{\theta})}
+{\sigma_j(\boldsymbol{\theta})}\right)
+\;\;\text{for "le"},
+$$
+
+and the joint feasibility probability is the product
+$\Pi(\boldsymbol{\theta}) = \prod_{j=1}^J \pi_j(\boldsymbol{\theta})$
+(`prob_feasibility_batch()`, vectorized across the whole candidate
+pool). The product form follows Gelbart, Snoek, and Adams (2014) and
+Gardner et al. (2014) and is exact when the constraint surfaces are
+independent, an assumption discussed in Section 2.
+
+## ECI
+
+Expected constrained improvement multiplies the two:
+
+$$
+\alpha_{\mathrm{ECI}}(\boldsymbol{\theta})
+= \mathrm{EI}(\boldsymbol{\theta}) \times \Pi(\boldsymbol{\theta}).
+$$
+
+A candidate scores highly only if it plausibly improves the objective
+*and* plausibly satisfies every constraint. Since the optimum of a
+constrained problem typically sits on the feasibility boundary, ECI
+naturally concentrates evaluations there: inside the feasible region
+$\Pi \approx 1$ and EI dominates; far outside, $\Pi \approx 0$ kills the
+score regardless of how good the objective looks. The exported
+implementation is `acq_eci()`.
+
+## Before any feasible point exists
+
+Early in a run with tight constraints, no evaluated design may be
+feasible, so there is no incumbent and EI is undefined. BATON then
+switches to an expected-violation criterion that steers the search toward
+the feasible region. For each constraint, let $z_j$ be the standardized
+*signed distance into the infeasible region* (for a "ge" constraint,
+$z_j = (t_j - \mu_j)/\sigma_j$; for "le", $z_j = (\mu_j - t_j)/\sigma_j$).
+The expected violation magnitude under the Gaussian posterior is
+
+$$
+\mathbb{E}\!\left[\max\{0, \text{violation}\}\right]
+= \sigma_j \left( z_j\,\Phi(z_j) + \phi(z_j) \right),
+$$
+
+which grows without bound as a point becomes more deeply infeasible and
+decays to zero well inside the feasible region, exactly the shape needed
+to pull the search across the boundary. `compute_expected_violation()`
+sums this over the constraints, and the pre-feasible acquisition is then
+
+$$
+\alpha_{\text{pre}}(\boldsymbol{\theta}) =
+\left(1 - \tilde{v}(\boldsymbol{\theta}) + 0.3\,\sigma_0(\boldsymbol{\theta})\right)
+\left(0.3 + 0.7\,\Pi(\boldsymbol{\theta})\right),
+$$
+
+where $\tilde{v}$ is the summed expected violation normalized by its
+maximum over the candidate pool. The three ingredients read directly:
+prefer small expected violation, keep a mild exploration bonus on
+objective uncertainty, and weight by feasibility probability without
+letting it hit zero. Once the first feasible design is observed, the
+acquisition switches to standard ECI.
+
+## Demonstration: ECI trading off improvement against feasibility
+
+A one-dimensional constrained problem makes the trade visible: minimize
+an expected-enrollment-like objective that increases in $x$, subject to a
+power-like constraint that also increases in $x$. Cheap designs are
+infeasible; feasible designs are expensive; the interesting region is the
+boundary. The chunk fits both surrogates through `fit_surrogates()`, then
+computes EI, $\Pi$, and ECI on a grid with the formulas above, inline for
+pedagogy, and checks the result against BATON's `acq_eci()`.
+
+```{r demo-eci-setup}
+set.seed(202)
+power_true <- function(x) plogis(9 * (x - 0.45))   # increasing in x
+en_true    <- function(x) 30 + 45 * x              # increasing in x
+
+n_pts  <- 14
+R_reps <- 300
+x_obs  <- seq(0.02, 0.98, length.out = n_pts)
+pow_hat <- rbinom(n_pts, R_reps, power_true(x_obs)) / R_reps
+en_hat  <- en_true(x_obs) + rnorm(n_pts, 0, 1.5)
+
+eci_history <- tibble::tibble(
+  unit_x   = lapply(x_obs, function(xi) c(x = xi)),
+  theta_id = vapply(x_obs, function(xi) BATON:::theta_to_id(c(x = xi)),
+                    character(1)),
+  metrics  = lapply(seq_len(n_pts),
+                    function(i) c(EN = en_hat[i], power = pow_hat[i])),
+  variance = lapply(seq_len(n_pts),
+                    function(i) c(EN = 1.5^2,
+                                  power = max(pow_hat[i] * (1 - pow_hat[i]),
+                                              0.01) / R_reps))
+)
+
+ctbl <- BATON:::parse_constraints(list(power = c("ge", 0.8)))
+sur2 <- fit_surrogates(eci_history, objective = "EN", constraint_tbl = ctbl)
+
+# Incumbent: best observed objective among observed-feasible designs
+feasible_obs <- pow_hat >= 0.8
+best_feas <- min(en_hat[feasible_obs])
+round(best_feas, 1)
+```
+
+```{r demo-eci-compute}
+pred2 <- BATON:::predict_surrogates(sur2, x_grid)
+mu_EN <- pred2$EN$mean;    sd_EN <- pred2$EN$sd
+mu_p  <- pred2$power$mean; sd_p  <- pred2$power$sd
+
+# Inline formulas (BATON's implementation lives in acq_eci / compute_ei)
+z_imp  <- (best_feas - mu_EN) / sd_EN
+ei     <- (best_feas - mu_EN) * pnorm(z_imp) + sd_EN * dnorm(z_imp)
+p_feas <- pnorm((mu_p - 0.8) / sd_p)
+eci    <- ei * p_feas
+
+# Same quantity through the package
+eci_pkg <- acq_eci(x_grid, sur2, ctbl, objective = "EN",
+                   best_feasible = best_feas)
+all.equal(eci, eci_pkg, tolerance = 1e-6)
+```
+
+```{r demo-eci-plot, eval = has_ggplot2, fig.height = 5.5, fig.alt = "Three stacked panels showing expected improvement, feasibility probability, and their product ECI over the design parameter"}
+df_eci <- rbind(
+  data.frame(x = x_grid[, "x"], value = ei,     panel = "1. EI (objective)"),
+  data.frame(x = x_grid[, "x"], value = p_feas, panel = "2. P(feasible)"),
+  data.frame(x = x_grid[, "x"], value = eci,    panel = "3. ECI = EI x P(feasible)")
+)
+ggplot(df_eci, aes(x = x, y = value)) +
+  geom_line(color = "steelblue", linewidth = 0.9) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  labs(x = "design parameter (unit scale)", y = NULL,
+       title = "ECI balances improvement against feasibility") +
+  theme_minimal()
+```
+
+EI alone would send the next evaluation to small $x$, where the objective
+is cheap but the power constraint is hopeless. The feasibility factor
+suppresses that region, and the ECI maximum lands near the constraint
+boundary, where a design might be both cheap and adequately powered. That
+is the location worth spending simulations on.
+
+## Batch selection by local penalization
+
+When `q > 1`, BATON must propose several points from the *same* surrogate
+state, and naively taking the top `q` acquisition scores returns `q`
+near-copies of the same maximizer. BATON uses the local penalization
+scheme of Gonzalez et al. (2016): select the acquisition maximizer, then
+suppress a ball around it and re-maximize, repeating until the batch is
+full. Concretely (`select_batch_local_penalization()`), after selecting
+point $\boldsymbol{\theta}_k$ with acquisition value $\alpha_k$, every
+remaining candidate at distance $r$ has its score reduced by
+
+$$
+\max\{0,\; \alpha_k - L\,r\},
+$$
+
+so the penalty is largest at the selected point and decays linearly to
+zero at radius $\alpha_k / L$. The constant $L$ is a Lipschitz-style
+smoothness estimate extracted from the objective GP
+(`estimate_lipschitz()`): $L = 2/\ell_{\min}$, twice the reciprocal of
+the smallest fitted lengthscale, so a wigglier objective (small
+lengthscale, large $L$) gets smaller suppression balls, consistent with
+the acquisition surface genuinely changing over shorter distances. If no
+lengthscales can be extracted, $L$ defaults to 10 on the unit cube.
+
+## The candidate pool
+
+The acquisition function is not maximized with gradients. Each iteration
+draws a fresh Latin hypercube candidate pool on the unit cube, scores
+every candidate in one vectorized pass (a single batched GP prediction
+per metric), and selects from the pool. The pool size adapts to the
+problem: $500 \times d$ points, clamped to $[1000, 5000]$, with the
+`candidate_pool` argument (default 2000) acting as a floor. A late-run
+refinement inflates the pool by 50 percent (capped at 10,000) once the
+iteration count exceeds 70 percent of `budget / q`; because that
+threshold counts the budget in batches without subtracting the initial
+design, it engages only when `n_init` is below 30 percent of the
+budget, and under the package defaults (`n_init = 90`, `budget = 300`)
+it never fires. Derivative-free maximization over a space-filling pool is robust
+to the multimodal, constraint-warped shape of the ECI surface and
+composes directly with the sequential penalization rule above.
+
+# 4. Multi-fidelity budgeting
+
+## Fidelity levels and the simulator contract
+
+`fidelity_levels` maps the labels `"low"`, `"med"`, `"high"` to
+replication counts (default `c(low = 2000, med = 4000, high = 10000)`).
+The initial design is evaluated entirely at the *first-named* level of
+`fidelity_levels`, and the selection methods below fall back to that
+same first-named level; under the default ordering that is `"low"`, but
+the names are accepted in any order, so reordering them changes which
+level plays this default role. Each BO batch point then gets its own
+fidelity decision.
+
+How the chosen count reaches your simulator matters. BATON always passes
+the fidelity *label* as the `fidelity` argument. If the simulator
+declares an explicit `n_rep` argument in its formals, BATON additionally
+passes the requested replication count, `n_rep =
+fidelity_levels[[fidelity]]` (including dynamically escalated counts
+under the `hybrid_staged` method), so the simulator can honor the exact
+budget instead of re-deriving it from the label. Accepting `...` alone
+does not opt in; this keeps wrappers that forward `...` to legacy
+simulators working. The realized count is recorded in the history's
+`n_rep` column, taken from the simulator's `n_rep` attribute when
+supplied and from the requested count otherwise. One exception to the
+opt-in rule: Stage 4 multi-seed verification (Section 5) always passes
+`n_rep` to the simulator, so a simulator used with
+`multi_seed_verify = TRUE` should accept `n_rep` explicitly or at least
+absorb it via `...` (the documented simulator signature does).
+
+## Budget accounting
+
+The `budget` argument counts *evaluations*, not replications:
+`eval_counter` increments once per simulator call, and the BO loop runs
+while `eval_counter < budget`. Replications are tracked separately: the
+cumulative sum of the history's `n_rep` column feeds the fidelity
+methods' cost reasoning, against an approximate total simulation budget
+of `budget * mean(fidelity_levels)`. Within a batch, the accounting uses
+the *requested* counts of earlier in-batch picks (batch points are
+conceptually simultaneous, which is what makes them independently
+evaluable in parallel).
+
+## The four selection methods
+
+`fidelity_method` chooses among four strategies, dispatched per batch
+point with that point's predicted feasibility probability, its
+surrogate coefficient of variation (predictive sd over absolute
+predictive mean), its acquisition value, the iteration number, and the
+replication budget consumed so far.
+
+**Threshold** (`"threshold"`, legacy) is a pure feasibility ladder:
+$P(\text{feasible}) \ge 0.75$ gets high fidelity, $\ge 0.40$ gets
+medium, everything else low. Simple and transparent: precision is spent
+where the surrogate already believes a design is likely feasible.
+
+**Staged** (`"staged"`) is iteration-scheduled. The first 30 iterations
+run entirely at low fidelity. From iteration 31 to 100, a point is
+promoted to high fidelity when it is both uncertain (CV above
+`fidelity_cv_threshold`, default 0.05) and near the feasibility boundary
+(feasibility probability inside `fidelity_prob_range`, default
+$[0.2, 0.8]$); otherwise medium fidelity for promising points
+($P \ge 0.4$) and low for the rest. After iteration 100, likely-feasible
+points ($P > 0.6$) go straight to high fidelity.
+
+**Hybrid staged** (`"hybrid_staged"`) layers three refinements on the
+staged idea: the fidelity levels themselves grow with iteration
+(`compute_dynamic_fidelity_levels()` scales the base levels up to
+threefold in the late phase, with a safety factor that backs the scaling
+off as the replication budget depletes); CV thresholds are
+metric-specific (constraints get a threshold twice as tight as the
+objective, on the argument that boundary precision is what feasibility
+decisions consume) and are tightened further near the boundary and near
+the current best design; and the CV that drives escalation switches from
+the objective's to the worst constraint's when the point sits in the
+boundary band. This is the most aggressive escalation schedule in the
+package.
+
+**Adaptive** (`"adaptive"`, the default) frames the choice as value per
+cost, in the spirit of cost-aware multi-fidelity acquisition (Wu and
+Frazier 2016). `select_fidelity_adaptive()` first builds a scalar value
+score for evaluating the candidate at all,
+
+$$
+v = \log(1 + \alpha) \cdot
+w_u\!\left(\min\{1, \mathrm{CV}/0.3\}\right) \cdot
+w_b\!\left(\sqrt{1 - |2P - 1|}\right),
+$$
+
+the product of the (log-damped) acquisition value, an uncertainty factor
+that saturates at CV $= 0.3$, and a boundary factor peaking at
+$P(\text{feasible}) = 0.5$. The affine weights $w_u, w_b$ shift with the
+run's stage: before iteration 20 the uncertainty factor dominates
+(exploration), between 20 and 60 the two balance, after 60 the boundary
+factor dominates (exploitation). Each fidelity's cost (by default
+proportional to its replication count, overridable via
+`fidelity_costs`) is normalized to $(0,1]$ and raised to a cost exponent
+
+$$
+\gamma = \min\{\,0.15 + 0.3\min(1, t/100) + 0.2\,\beta,\;\; 0.8\,\},
+$$
+
+which increases with iteration $t$ and with the fraction $\beta$ of the
+replication budget already consumed: the search becomes more
+cost-sensitive as resources deplete. The method then maximizes $v /
+(\tilde{c}^{\,\gamma} + 10^{-6})$ over the levels, after an exploration
+override that forces low fidelity with probability
+$\max\{0.05, 0.5\,e^{-t/30}\}$.
+
+One property of this construction deserves an honest flag: the value
+score $v$ is the same number for every fidelity level (nothing in it
+depends on $R$), so the value-per-cost ranking is decided entirely by
+the cost term, and whenever the levels have unequal costs the cheapest
+level maximizes it. In the current implementation the adaptive method is
+therefore maximally cost-conservative: it keeps the whole search at the
+lowest fidelity and relies on the heteroskedastic surrogate to weigh the
+resulting noisy evaluations appropriately (plus the optional Stage 4
+verification, Section 5, for a high-precision check of the final
+design). If you want fidelity escalation during the search itself, use
+`"threshold"`, `"staged"`, or `"hybrid_staged"`. The demonstration below
+uses `"threshold"` for exactly this reason, and because the staged
+schedules operate on iteration scales (30 to 100 iterations) that a
+vignette-sized run never reaches.
+
+## Demonstration: fidelity routing in a tiny run
+
+A two-parameter toy calibration, small enough to knit quickly: minimize
+expected enrollment subject to a power constraint, with deliberately tiny
+replication counts. The simulator declares `n_rep`, so it receives the
+exact requested count; the history records the fidelity label and count
+for every evaluation.
+
+```{r demo-fidelity-run}
+toy_sim <- function(theta, fidelity = "low", seed = NULL, n_rep = NULL, ...) {
+  p_true  <- plogis(6 * (theta$dose - 0.3) + 2 * (theta$cut - 0.5))
+  en_true <- 25 + 20 * theta$dose + 10 * theta$cut
+  p_hat   <- rbinom(1, n_rep, p_true) / n_rep
+  en_hat  <- en_true + rnorm(1, 0, 5 / sqrt(n_rep))
+  metrics <- c(power = p_hat, EN = en_hat)
+  attr(metrics, "variance") <- c(power = max(p_hat * (1 - p_hat), 0.01) / n_rep,
+                                 EN = 25 / n_rep)
+  attr(metrics, "n_rep") <- n_rep
+  metrics
+}
+
+fit <- bo_calibrate(
+  sim_fun = toy_sim,
+  bounds = list(dose = c(0, 1), cut = c(0, 1)),
+  objective = "EN",
+  constraints = list(power = c("ge", 0.6)),
+  n_init = 12, q = 2, budget = 40, seed = 7,
+  fidelity_levels = c(low = 100, med = 400, high = 1600),
+  fidelity_method = "threshold",
+  early_stop = list(enabled = FALSE),  # keep all iterations for display
+  progress = FALSE
+)
+
+fit$status
+with(fit$history, table(iter, fidelity))
+```
+
+Iteration 0 is the initial design, all at low fidelity by construction.
+From iteration 1 on, each batch point is routed by its predicted
+feasibility probability: exploratory picks in uncertain territory stay
+at low fidelity, while picks the surrogates already believe feasible are
+promoted to medium or high fidelity, so precision concentrates where
+feasibility decisions are being made. (Early stopping is disabled here
+only so the full table is displayed; a run this small would otherwise
+converge and stop within a handful of iterations.) The recorded `n_rep`
+column confirms the simulator received the requested counts:
+
+```{r demo-fidelity-history}
+tail(fit$history[, c("eval_id", "iter", "fidelity", "n_rep",
+                     "objective", "feasible")], 8)
+round(unlist(fit$best_theta), 3)
+```
+
+# 5. The loop end to end
+
+With the components in place, one BO iteration of `bo_calibrate()` is,
+in the actual execution order:
+
+1. **Walltime check** (only if `max_walltime_s` is set): the cap is
+   checked at the top of each iteration, never mid-batch, so a capped run
+   always returns an internally consistent partial fit.
+2. **Fit surrogates.** One GP per metric on the full history, warm-started
+   from the previous iteration's fits, under a deterministic fit seed
+   (Section 6). If warm-started fitting errors, retry cold.
+3. **Compute the incumbent** $f^*$ (see below).
+4. **Draw the candidate pool**: a fresh LHS of adaptive size on the unit
+   cube.
+5. **Score the pool once.** A single batched prediction per metric yields
+   means and sds for every candidate; feasibility probabilities and
+   acquisition scores (ECI, or the pre-feasible violation score) are
+   computed vectorized from those predictions.
+6. **Select the batch.** The top scorer if only one point remains in the
+   budget; otherwise local penalization picks `q` spatially separated
+   points.
+7. **Choose fidelities.** Each batch point independently gets a fidelity
+   from the configured method, using its cached predictions and the
+   replication budget consumed so far.
+8. **Evaluate and record.** The batch is evaluated (in parallel across
+   forked workers when `options(BATON.cores = k)` is set on Unix), each
+   evaluation under its own derived seed, and all rows are appended to
+   the history in one bind.
+9. **Callback and checkpoint hooks** (v0.7.0, both optional): the
+   `callback` runs at the end of the iteration and can cancel the run
+   cooperatively; `checkpoint_fun` receives a slim resumable snapshot
+   every `checkpoint_every` iterations.
+10. **Early-stopping checks** (below), then loop while evaluations
+    remain.
+
+After the loop, the surrogates are refit once on the final history
+(skipped under `slim = TRUE`), diagnostics are generated, and, if
+requested, Stage 4 multi-seed verification re-evaluates the selected
+design at several independent seeds at high fidelity and stamps a
+pass/fail verdict on the fit.
+
+## Incumbent definitions
+
+The incumbent $f^*$ anchors EI, so its definition matters under noise.
+`incumbent_method` offers two:
+
+- **BPM, best posterior mean (default).** Predict the objective
+  surrogate at every feasible evaluated design and take the minimum
+  posterior *mean*. Because the GP smooths Monte Carlo noise, BPM is
+  robust to a lucky low-fidelity draw masquerading as a great design,
+  the plug-in approach of Picheny et al. (2013).
+- **BOI, best observed incumbent.** The minimum observed objective among
+  feasible rows. Sensitive to noise, but independent of surrogate
+  quality.
+
+Both are computed preferentially over *high-fidelity* feasible
+evaluations: once any high-fidelity evaluation exists in the history, the
+incumbent restricts to feasible high-fidelity rows, falling back to
+any-fidelity feasible rows when that restriction would leave nothing
+(returning to "no incumbent" just because precision is still low would
+wrongly flip the acquisition back into pre-feasible mode). If no feasible
+design exists at any fidelity, the incumbent is $+\infty$ and the
+pre-feasible acquisition of Section 3 is used. Note the returned
+`best_theta`/`best_objective` of the fit are the best *observed*
+feasible row when one exists, regardless of the incumbent method used
+during the search; if the run ends with no feasible design at all,
+`best_objective` is `NA` and `best_theta` is the best infeasible design,
+flagged by a warning.
+
+## Early stopping
+
+Two convergence tests run at the end of every iteration (after a minimum
+of 3 BO iterations), both configurable through `early_stop` and enabled
+by default:
+
+- **Improvement plateau.** Track the best feasible objective per
+  iteration. If the relative improvement over the last `patience`
+  iterations (default 5) falls below `threshold` (default $10^{-3}$, so
+  0.1 percent), a counter increments; when it reaches `consecutive`
+  (default 2) the run stops with status `"early_stopped"`. The
+  comparison only happens within the feasible phase: before the first
+  feasible point the tracked quantity is the best infeasible objective,
+  a different quantity, and comparing across the transition could stop
+  the run at the exact moment it first becomes feasible.
+- **Acquisition flatline.** If the maximum acquisition value of the
+  *selected batch* stays below a small level for 3 consecutive
+  iterations, the run stops with status `"acq_flatline"`. Once a
+  feasible incumbent exists the level is `acq_rel * |incumbent|`
+  (default `acq_rel = 1e-3`), scaling the criterion with the objective's
+  magnitude so it means the same thing for an objective of order 1 or
+  order 100; before feasibility the level is `acq_rel` itself.
+
+The fit's `status` field records why the run ended:
+`"budget_exhausted"`, `"early_stopped"`, `"acq_flatline"`,
+`"walltime"`, `"cancelled"`, or `"errored"`.
+
+# 6. Implementation notes for reproducibility and scale
+
+## Unit-hypercube internals
+
+All modeling happens on $[0,1]^d$: `scale_to_unit()` /
+`scale_from_unit()` map between raw parameter values and unit
+coordinates, the LHS designs and candidate pools are drawn in unit
+space, and GP lengthscales are unit-scale quantities. Raw values are
+reconstructed only at the simulator boundary, where `integer_params` are
+also rounded to the nearest integer before the call.
+
+## Deduplication and aggregation via `theta_id`
+
+Every design gets a deterministic string identifier: its unit
+coordinates rounded to six decimals, fixed-notation formatted, and
+joined (`theta_to_id()`; fixed notation per coordinate keeps the id
+independent of session options and of other coordinates' magnitudes).
+The id deduplicates LHS top-up draws against donor rows when
+warm-starting from a previous run, and it defines the replicate groups
+that the surrogate fitting aggregates (Section 2), so re-evaluations of
+the same design reinforce one location instead of creating spurious
+near-duplicate rows.
+
+## The seeding architecture
+
+Reproducibility is engineered around one base seed and deterministic
+derivations from it:
+
+- The run seed is `seed` (default 2025). With an explicit seed, the
+  caller's RNG stream is restored on every exit path, so calling
+  `bo_calibrate()` never advances `.Random.seed` in the calling
+  environment. With `seed = NULL`, the run seed is drawn from the
+  caller's stream with a single `sample.int()` draw (the stream advances
+  by exactly one step, so repeated `seed = NULL` calls give independent
+  replicates) and everything after is still rewound.
+- **Every simulator call** runs under a derived seed, `seed + eval_id`,
+  inside `run_seeded()`: the RNG state is saved, `set.seed()` applied,
+  the call made, and the caller's state restored. The same derived seed
+  is also passed to the simulator's `seed` argument so simulators
+  managing their own streams stay reproducible.
+- **Every GP fit** likewise runs under a derived seed (`seed + 10000 *
+  iter + metric index` in-loop, `seed + 99999` for the final refit),
+  because `km` and `mleHetGP` use randomized multi-starts whose outcome
+  would otherwise depend on RNG stream position.
+
+The consequence is a strong guarantee: results are bit-identical whether
+evaluations and fits run serially or in parallel under
+`options(BATON.cores = k)`, and regardless of the order forked workers
+complete, because no random draw anywhere in the pipeline depends on
+stream position.
+
+## Parallel evaluation model
+
+Parallelism is opt-in via `options(BATON.cores = k)` and uses fork-based
+`parallel::mclapply()`, so it is effective on Unix (Linux, macOS) and
+silently serial elsewhere (`effective_cores()` makes that decision in
+one place). Three regions parallelize: the initial-design evaluations
+(chunked, so a walltime cap can be checked at chunk boundaries without
+losing throughput), each BO batch (its `q` points are independent by
+construction), and the per-metric surrogate fits. Worker errors are
+re-thrown to match serial behavior.
+
+## Service controls (v0.7.0)
+
+For long or unattended calibrations, `bo_calibrate()` exposes a set of
+operational controls: a `status` field on every returned fit recording
+why the run ended; `max_walltime_s` for an advisory walltime cap with a
+consistent partial return; `on_error = "return_partial"` to convert
+mid-run failures into a partial fit carrying every completed evaluation
+and the error message; `callback` for per-iteration monitoring with
+cooperative cancellation; `checkpoint_fun` / `checkpoint_every` for
+periodic resumable snapshots (resume by passing a checkpoint's history
+back as `initial_history`); and `slim = TRUE` for lightweight decision
+objects that drop the large GP and diagnostic components while keeping
+the history and the adoption gate. See `?bo_calibrate` for the full
+contracts and `vignette("BATON-introduction", package = "BATON")` for
+usage patterns.
+
+# 7. What BATON does not do
+
+Honest scoping, so you can decide quickly whether it fits your problem:
+
+- **No equality constraints.** Constraints are one-sided (`"ge"` or
+  `"le"`). An (approximate) equality target must be encoded as a pair of
+  inequalities with a tolerance band, at the cost of a thin feasible
+  region that is genuinely harder to search.
+- **Box bounds only.** The design space is a product of intervals. Joint
+  restrictions between parameters (say, an interim time that must precede
+  the final analysis) should be handled by reparameterizing (optimize the
+  gap rather than the second time point) or, less efficiently, by having
+  the simulator return an infeasible-signaling metric value.
+- **Single objective.** One metric is minimized. Multi-objective
+  trade-offs are handled the classical way: minimize a weighted
+  combination (the companion manuscript's weighted sample-size loss,
+  spanning optimal, minimax, and admissible design philosophies, is
+  exactly this recipe) and trace the frontier by re-running with
+  different weights. A hypervolume-based acquisition (qEHVI) is future
+  work; the internal `acq_qehvi` placeholder currently warns and falls
+  back to ECI.
+- **Gaussian-ish aggregate noise.** The GP machinery treats each
+  observed metric as Gaussian around its true value, which is well
+  justified for Monte Carlo *averages* over hundreds of replicates but
+  degrades for extreme proportions at low fidelity (where the binomial
+  is skewed) and for heavy-tailed summaries. Raising the low-fidelity
+  replication count is the practical mitigation.
+
+# 8. Citing BATON and references
+
+If you use BATON in published work, please cite the methods manuscript;
+this vignette paraphrases it and the package implements it:
+
+> Young, A. M., Li, D., Hilsenbeck, S. G., Tayob, N., Chen, R., Yuan,
+> Y., Bates, S., Kelly, E., Burns, R., Jhaveri, K., Tolaney, S. M.,
+> Spears, P. A., Goetz, M. P., Davidson, N. E., Norton, L., Perou,
+> C. M., Krop, I. E., Wolff, A. C., Winer, E. P., Carey, L. A., and
+> Rashid, N. U. "BATON: Constrained Bayesian Optimization for
+> Calibrating Adaptive Trials." Submitted.
+
+Methodological references drawn on above:
+
+- Binois, M., Gramacy, R. B., and Ludkovski, M. (2018). Practical
+  heteroscedastic Gaussian process modeling for large simulation
+  experiments. *Journal of Computational and Graphical Statistics*,
+  27(4), 808-821. (The hetGP model and package.)
+- Gardner, J. R., Kusner, M. J., Xu, Z., Weinberger, K. Q., and
+  Cunningham, J. P. (2014). Bayesian optimization with inequality
+  constraints. *ICML*.
+- Gelbart, M. A., Snoek, J., and Adams, R. P. (2014). Bayesian
+  optimization with unknown constraints. *UAI*.
+- Gonzalez, J., Dai, Z., Hennig, P., and Lawrence, N. (2016). Batch
+  Bayesian optimization via local penalization. *AISTATS*.
+- Jones, D. R., Schonlau, M., and Welch, W. J. (1998). Efficient global
+  optimization of expensive black-box functions. *Journal of Global
+  Optimization*, 13, 455-492. (Expected improvement.)
+- Picheny, V., Wagner, T., and Ginsbourger, D. (2013). A benchmark of
+  kriging-based infill criteria for noisy optimization. *Structural and
+  Multidisciplinary Optimization*, 48, 607-626. (Plug-in incumbents
+  under noise.)
+- Roustant, O., Ginsbourger, D., and Deville, Y. (2012). DiceKriging,
+  DiceOptim: Two R packages for the analysis of computer experiments by
+  kriging-based metamodeling and optimization. *Journal of Statistical
+  Software*, 51(1), 1-55.
+- Wu, J., and Frazier, P. (2016). The parallel knowledge gradient method
+  for batch Bayesian optimization. *NeurIPS*. (Cost-aware multi-fidelity
+  motivation.)
+
+```{r session-info}
+sessionInfo()
+```

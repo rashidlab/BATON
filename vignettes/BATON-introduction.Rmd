@@ -16,45 +16,250 @@ knitr::opts_chunk$set(
   fig.width = 7,
   fig.height = 5
 )
+# Suppress the one-time q-default migration note so chunk output stays clean.
+options(BATON.q_warning_shown = TRUE)
 ```
 
-# Overview
+# What Problem BATON Solves
 
-The **BATON** package provides a modular framework for constrained Bayesian optimization of Bayesian adaptive clinical trial designs. It implements:
+Designing an adaptive clinical trial means choosing design parameters, for
+example the maximum sample size, the timing of an interim look, and the
+decision thresholds applied at each analysis, so that the trial achieves
+adequate power while controlling type I error, and at the same time
+minimizes a quantity you care about such as the expected sample size. These
+performance measures are collectively called operating characteristics. For
+adaptive designs they are usually impossible to compute analytically: the
+only way to know the power of a two-stage design with a futility rule is to
+simulate thousands of trial replicates and count how often the trial rejects.
+Calibration is therefore a constrained optimization problem where every
+function evaluation is expensive and every observed value is noisy, because
+it is a Monte Carlo estimate rather than an exact number.
 
-- **Heteroskedastic Gaussian process surrogates** for modeling operating characteristics
-- **Constraint-aware acquisition functions** (Expected Constrained Improvement)
-- **Multi-fidelity simulation** for efficient budget allocation
-- **Sensitivity and covariance analyses** for design understanding
+Grid search, the traditional approach, fails on both counts. A grid fine
+enough to locate a good design in four parameters at ten points per axis
+needs 10,000 simulator calls, almost all of them spent in regions a few
+early evaluations would have ruled out. And because each grid value is
+noisy, the apparent best cell may just be the luckiest one. BATON replaces
+the grid with constrained Bayesian optimization: it fits a Gaussian process
+surrogate (a fast statistical stand-in for your simulator) to each operating
+characteristic, weights each observation by its Monte Carlo noise, scores
+candidate designs by expected constrained improvement (how much a candidate
+is likely to improve the objective while still satisfying the constraints),
+and spends cheap low-replication simulations on exploration while reserving
+high-replication runs for verification. It works with any trial simulator,
+Bayesian or frequentist, and needs no gradients or closed forms. This
+vignette walks through the full workflow: writing an evaluator, running a
+calibration, reading its output, sizing the settings, and diagnosing runs
+that go wrong.
 
 # Installation
 
+`DiceKriging` and `hetGP` require C and Fortran compilers. On Ubuntu/Debian
+install `build-essential` and `gfortran`; on Fedora/RHEL install `gcc`,
+`gcc-c++`, and `gcc-gfortran`; on macOS run `xcode-select --install` and add
+`gfortran` (from <https://mac.r-project.org/tools/> or `brew install gcc`);
+on Windows install Rtools matching your R version. If installation fails
+with `gfortran: command not found`, the Fortran compiler is the missing
+piece.
+
 ```{r eval=FALSE}
-# Install from GitHub
-devtools::install_github("rashidlab/BATON")
+install.packages("remotes")
+remotes::install_github("rashidlab/BATON")
+
+# With vignettes (requires knitr, rmarkdown):
+remotes::install_github("rashidlab/BATON", build_vignettes = TRUE)
 ```
+
+BATON requires R >= 4.2. The companion package
+[evolveTrial](https://github.com/naimurashid/evolveTrial) provides
+ready-made oncology trial simulators, but it is optional: BATON works with
+any evaluator you write yourself, which is what this vignette teaches.
 
 ```{r}
 library(BATON)
 ```
 
-# Quick Start Example
+# The Evaluator: Your Side of the Contract
 
-## 1. Define Your Simulator
+BATON's division of labor is strict and simple. You supply one function,
+the evaluator, that simulates your trial design at a given set of
+parameters and reports its operating characteristics. BATON supplies
+everything else: the initial space-filling design, the surrogate models,
+the acquisition logic, the fidelity scheduling, and the bookkeeping. To
+calibrate your own design you replace exactly one piece of code, the
+function that simulates a single trial. Everything in this section is about
+getting that one piece right.
 
-The simulator is the core of your calibration workflow. It takes design parameters and returns operating characteristics (power, type I error, expected sample size, etc.).
+## The Contract
 
-### Basic Simulator Structure
+The canonical evaluator signature is:
 
-This simulator models a **two-stage adaptive trial with early stopping for futility**.
-At an interim look, the trial stops early if the observed response rate is too low to be
-promising. Otherwise, enrollment continues to `n_max` and H0 is rejected if the final
-response rate exceeds `efficacy_threshold`.
+```
+function(theta, fidelity, seed = NULL, n_rep = NULL, ...)
+```
 
-Note that in practice, BATON is designed for *computationally expensive* simulators
-(e.g., survival trials with Bayesian posterior probability stopping rules that take
-seconds per evaluation). The toy simulator below is intentionally fast for vignette
-purposes, but the optimization workflow is identical.
+Each argument has a specific job:
+
+1. **`theta`** is a named list of design parameters (e.g., `theta$nmax`,
+   `theta$threshold`). Values arrive exactly as BATON proposes them, which
+   means fractional, unless you list a parameter in `integer_params`, in
+   which case BATON rounds it before the call. Rounding inside your own
+   simulator is the alternative; the two approaches are interchangeable,
+   but `integer_params` also makes the returned `best_theta` integer-valued
+   for those parameters.
+2. **`fidelity`** is a label from `c("low", "med", "high")` naming the
+   requested fidelity tier. Multi-fidelity optimization is how BATON
+   affords exploration: most evaluations run at the cheap low tier, and the
+   expensive high tier is reserved for designs worth verifying.
+3. **`n_rep`**: if your function declares an `n_rep` argument, BATON passes
+   the exact requested replication count, `fidelity_levels[[fidelity]]`,
+   including any dynamic escalation some fidelity methods apply. A
+   hardcoded `switch(fidelity, ...)` inside the evaluator is only a
+   fallback for calls made outside BATON; if you use one, keep it in sync
+   with your `fidelity_levels` or the budget accounting will not match what
+   your simulator actually did.
+4. **`seed`** is always passed by BATON, derived deterministically from the
+   run seed. Apply it with `set.seed(seed)` when non-NULL so every
+   evaluation is reproducible. Your own RNG stream is restored when
+   `bo_calibrate()` exits.
+5. **The return value** is a named numeric vector of operating
+   characteristics, for example `c(power = 0.83, type1 = 0.07, EN = 52)`.
+   The names are entirely yours; `power`, `type1`, and `EN` are conventions
+   of this vignette, not requirements. The only rule is that `objective`
+   and every name in `constraints` must be names your evaluator returns.
+6. **Variance attributes (recommended)**: attach `attr(result, "variance")`
+   (the Monte Carlo variance of each metric's mean) and
+   `attr(result, "n_rep")` (the replication count actually used). These
+   unlock the noise-aware surrogate discussed below.
+
+## The Minimal Template
+
+The template below is the whole adapter. Part 1 is the only code you write
+from scratch; parts 2 and 3 you usually keep as-is.
+
+```{r eval=FALSE}
+library(BATON)
+
+# ---- 1. YOUR TRIAL LOGIC (replace this) -------------------------------
+# Simulate ONE trial at design parameters theta; return named metrics.
+sim_one_trial <- function(theta) {
+  # ... your design logic here ...
+  stop("REPLACE: simulate one replicate of YOUR design")
+  # c(power = ..., type1 = ..., EN = ...)   # any names you like
+}
+
+# ---- 2. BATON ADAPTER (usually keep as-is) ----------------------------
+my_evaluator <- function(theta, fidelity = c("low", "med", "high"),
+                         seed = NULL, n_rep = NULL, ...) {
+  fidelity <- match.arg(fidelity)
+  if (is.null(n_rep)) {                      # fallback if BATON did not pass n_rep
+    n_rep <- switch(fidelity, low = 2000, med = 4000, high = 10000)
+  }
+  if (!is.null(seed)) set.seed(seed)
+  result <- welford_mean_var(function(i, theta) sim_one_trial(theta),
+                             n_samples = n_rep, theta = theta)
+  metrics <- result$mean
+  attr(metrics, "variance") <- result$variance
+  attr(metrics, "n_rep") <- result$n
+  metrics
+}
+
+# ---- 3. CALIBRATE -----------------------------------------------------
+fit <- bo_calibrate(
+  sim_fun     = my_evaluator,
+  bounds      = list(...),        # named list: one c(lower, upper) per parameter
+  objective   = "EN",             # a metric your evaluator returns
+  constraints = list(power = c("ge", 0.80), type1 = c("le", 0.10)),
+  n_init = 20, budget = 60, seed = 1
+)
+```
+
+Walking through the adapter piece by piece:
+
+- `match.arg(fidelity)` validates the label and picks `"low"` when the
+  caller supplies nothing, which is convenient for interactive testing.
+- The `switch()` fallback only fires when `n_rep` is `NULL`, i.e., when you
+  call the evaluator by hand. When BATON calls it, `n_rep` carries the
+  exact count from `fidelity_levels`, so the fallback is bypassed. The
+  numbers in the fallback should mirror the `fidelity_levels` you pass to
+  `bo_calibrate()` (here the package defaults) so a manual call at
+  `fidelity = "low"` behaves like a BATON call at the low tier.
+- `welford_mean_var()` runs `sim_one_trial()` `n_rep` times and returns the
+  mean and the variance of the mean for every metric in a single pass,
+  without ever storing the individual replicates. This matters when
+  `n_rep` is large: storing 10,000 replicates of 4 metrics costs about
+  312 KB per evaluation, while the Welford accumulator holds two small
+  vectors regardless of `n_rep`:
+
+```{r}
+n_rep <- 10000; n_metrics <- 4
+c(store_all_bytes = 8 * n_rep * n_metrics,
+  welford_bytes   = 8 * 2 * n_metrics)
+```
+
+- The two `attr()` lines are what turn a plain simulator into a
+  noise-aware one. The next section explains exactly what they buy.
+
+## What the Variance and n_rep Attributes Buy You
+
+BATON fits one surrogate per metric, and the surrogate type is chosen per
+metric based on what your evaluator provides:
+
+| Scenario | Surrogate used | How to enable |
+|----------|----------------|---------------|
+| Evaluator attaches `attr(result, "variance")` for the metric | hetGP (recommended) | Use `welford_mean_var()` or compute `var(x)/n_rep` yourself |
+| No variance attribute, metric in [0,1] (e.g., power, type I error) | hetGP via binomial approximation | Automatic: BATON estimates `p(1-p)/n_rep` |
+| No variance attribute, metric outside [0,1] (e.g., EN) | DiceKriging (homoskedastic) | Provide the variance attribute to upgrade |
+| Analytical evaluator (no Monte Carlo noise) | DiceKriging with a small nugget | Appropriate: there is no noise to model |
+
+A heteroskedastic GP (hetGP) lets the model trust precise observations more
+than noisy ones. This is not a cosmetic refinement for trial simulators,
+because the Monte Carlo variance of expected sample size is strongly
+input-dependent: a design with aggressive early stopping produces a bimodal
+distribution of realized sample sizes (stopped early vs ran to the end),
+hence high variance, while a design that rarely stops early concentrates
+near the maximum, hence low variance. A constant-noise GP has to pick one
+noise level for the whole space, oversmoothing one region and
+undersmoothing the other. In benchmarks, providing the EN variance improved
+the best feasible design found by roughly 15%, and variance-aware
+surrogates overall reduce the evaluations needed by 30-50%.
+
+If you omit the attributes entirely, nothing breaks. Metrics that live in
+[0,1] still get a binomial variance estimate automatically (BATON knows a
+proportion's variance from its value and `n_rep`), so power and type I
+error surrogates stay noise-aware. Only metrics outside [0,1], typically
+your objective, fall back to the homoskedastic model. That is suboptimal
+but not incorrect; if you cannot modify an external simulator to report
+variances, budget 20-50% more evaluations to compensate.
+
+# A Worked Example: Two-Stage Trial with Futility Stopping
+
+Now we build a complete evaluator from scratch and calibrate it. The design
+is a single-arm binary-endpoint trial with one interim look: after a
+fraction of the maximum sample size has been enrolled, the trial stops for
+futility if the observed response rate is below a futility threshold;
+otherwise it enrolls to `n_max` and rejects the null hypothesis if the
+final response rate exceeds an efficacy threshold. Four parameters define
+the design, and all four are calibrated jointly: `n_max`, the interim
+fraction, and the two thresholds.
+
+In practice BATON is aimed at computationally expensive simulators, for
+example survival trials with Bayesian posterior-probability stopping rules
+that take seconds per evaluation. The simulator here is intentionally fast
+so this vignette knits quickly, but the workflow is identical: only the
+body of the simulation changes.
+
+## Building the Evaluator
+
+Two modeling decisions come first. The trial tests a null response rate of
+0.20 against an alternative of 0.40; these are fixed assumptions, not
+calibrated parameters, so they live outside the evaluator. And because
+power must be estimated under the alternative while type I error must be
+estimated under the null, the evaluator simulates under both hypotheses in
+every call and returns both metrics in one vector. This
+"both hypotheses per call" pattern is the standard shape for calibration
+evaluators: BATON constrains power and type I error simultaneously, so it
+needs both numbers for every design it tries.
 
 ```{r}
 # Fixed assumptions about the trial (not optimized)
@@ -94,7 +299,7 @@ simple_simulator <- function(theta, fidelity = c("low", "med", "high"),
     x_interim  <- rbinom(n_rep, n_interim, p)
     not_futile <- (x_interim / n_interim) >= futility_threshold
 
-    # Stage 2: remaining responses (only for non-futile trials)
+    # Stage 2: remaining responses (only counted for non-futile trials)
     x_remaining <- rbinom(n_rep, n_final, p)
     x_total     <- x_interim + x_remaining
 
@@ -126,10 +331,36 @@ simple_simulator <- function(theta, fidelity = c("low", "med", "high"),
 }
 ```
 
-### Test the Simulator
+Design choices worth noting:
+
+- **`round(theta$n_max)`**: sample sizes must be integers but BATON
+  proposes continuous values, so the evaluator rounds internally. The
+  alternative, `integer_params = "n_max"` in the `bo_calibrate()` call, is
+  demonstrated later.
+- **Vectorization instead of Welford**: because each replicate here is one
+  `rbinom()` draw per stage, all `n_rep` replicates can be simulated in a
+  single vectorized call, and the variance of each mean is just
+  `var(x) / n_rep`. When one replicate is a genuine function call (a whole
+  trial simulation with patient-level logic), use `welford_mean_var()` as
+  in the Minimal Template instead. Both routes end at the same place: a
+  named metrics vector with `variance` and `n_rep` attributes.
+- **`EN` is computed under the alternative** (`mean(alt$en)`). Which
+  hypothesis you minimize expected sample size under is a design decision:
+  minimizing `E[N]` under the null protects patients when the treatment
+  does not work, minimizing it under the alternative shortens trials of
+  effective treatments, and either is a legitimate objective. This
+  vignette uses the alternative; to switch, return `mean(null$en)`
+  instead, or return both as separate metrics and point `objective` at
+  either one.
+
+## Sanity-Check the Evaluator Before Optimizing
+
+Always call your evaluator by hand before handing it to `bo_calibrate()`.
+This catches shape errors (wrong names, missing attributes) in seconds
+instead of twenty minutes into a run, and gives you a feel for the
+magnitude of the Monte Carlo noise.
 
 ```{r}
-# Test with some parameters
 test_result <- simple_simulator(
   theta = list(n_max = 60, interim_fraction = 0.5,
                futility_threshold = 0.20, efficacy_threshold = 0.35),
@@ -138,10 +369,25 @@ test_result <- simple_simulator(
 )
 
 print(test_result)
-print(attr(test_result, "variance"))
+print(sqrt(attr(test_result, "variance")))  # standard errors of each metric
 ```
 
-## 2. Define Design Space and Constraints
+The output is already informative. This hand-picked design has power of
+about 0.73, short of the 0.80 floor, so it is close to but not inside the
+feasible region; its type I error is far below 0.10, which says the
+efficacy bar of 0.35 is conservative at this sample size; and its expected
+sample size is near 60 because futility stopping rarely triggers under the
+alternative. In other words, there is room to trade type I error slack for
+power, exactly the kind of rebalancing the optimizer will do. The standard
+errors confirm the low tier estimates proportions to about a percentage
+point here. If your evaluator errors out, returns unnamed values, or
+produces `NA`s at this stage, fix that before any optimization.
+
+# Setting Up the Optimization
+
+Three objects define the problem: the parameter box (`bounds`), the metric
+to minimize (`objective`), and the conditions a design must satisfy
+(`constraints`).
 
 ```{r}
 # Parameter bounds
@@ -162,24 +408,47 @@ constraints <- list(
 )
 ```
 
-Which hypothesis you minimize expected sample size under is a design decision:
-minimizing `E[N]` under the null protects patients when the treatment does not
-work, minimizing it under the alternative shortens trials of effective
-treatments, and either is a legitimate objective. This vignette minimizes `EN`
-under the alternative (the simulator returns `mean(alt$en)`); the README's
-examples minimize it under the null.
+**Bounds** should bracket the plausible optimum generously. BATON rescales
+everything to the unit cube internally, so wide bounds do not break the
+model; they just spend more budget exploring. If the final best design
+lands on a bound, that is the signal to widen and re-run. One structural
+rule: bounds are independent boxes, so interdependent parameters must be
+reparameterized. This example already does it: instead of calibrating an
+interim sample size `n_interim` (which must stay below `n_max`, a
+constraint a box cannot express), it calibrates `interim_fraction` on
+[0.3, 0.7], which is freely variable no matter what `n_max` is. The same
+trick applies to ordered thresholds: calibrate the first threshold and a
+positive gap rather than two thresholds that must stay ordered.
 
-## 3. Run Bayesian Optimization
+**Constraints** are a named list mapping a metric name to a direction
+(`"ge"` or `"le"`) and a threshold. Leave slack larger than the Monte Carlo
+error of your simulator, because a constraint tighter than your noise is
+unenforceable. The arithmetic is worth doing explicitly. For a proportion
+estimated from `n_rep` replicates, the standard error is
+`sqrt(p (1 - p) / n_rep)`:
 
-The settings below follow the **Quick profile** from the README's "Run
-Profiles" table (`n_init` = 4-5 x d, `budget` = 10-15 x d): appropriate for a
-first exploratory run while you iterate on bounds, constraints, and metric
-definitions. For a run whose answer you intend to act on, use the Balanced
-profile (`n_init` = 10 x d, `budget` = 20-30 x d); for manuscript or
-regulatory numbers, the Thorough profile. See the README for the full table.
+```{r}
+se_type1 <- sqrt(0.10 * 0.90 / 2000)
+round(c(se = se_type1, two_se = 2 * se_type1), 4)
+```
 
-```{r eval=FALSE}
-# Run calibration (d = 4; Quick profile sizing)
+Estimating a type I error near 0.10 from 2000 replicates gives a standard
+error of about 0.0067, so any estimate within roughly +/- 0.013 of the
+threshold is statistically indistinguishable from the boundary. Designs in
+that band are neither reliably feasible nor reliably infeasible at the low
+tier; they need higher-fidelity verification, which is exactly what the
+verification step at the end of this vignette provides.
+
+# Running the Calibration
+
+The settings below follow the Quick profile from the Run Profiles table
+later in this vignette (`n_init` about 5 x d, `budget` about 15 x d, here
+with d = 4 parameters): the right sizing for a first exploratory run while
+you iterate on bounds, constraints, and metric definitions. The defaults
+(`n_init = 90`, `budget = 300`) are sized for production runs and would be
+a lot of simulation to discover a typo in your evaluator.
+
+```{r calibrate, message=FALSE}
 fit <- bo_calibrate(
   sim_fun = simple_simulator,
   bounds = bounds,
@@ -192,107 +461,521 @@ fit <- bo_calibrate(
 )
 ```
 
-## 4. Examine Results
+## Reading the Progress Output
 
-```{r eval=FALSE}
-# Not evaluated at build time: depends on `fit` from the (non-evaluated)
-# calibration chunk above.
-# Best design parameters and objective
-print(fit$best_theta)
+The chunk above suppresses the live progress messages to keep this
+document compact. The transcript below is the actual console output of
+exactly that call (same seed, same settings), abridged at the `...` marks.
+
+```
+Initialising BATON calibration with seed = 2025
+Fidelity selection method: 'adaptive'
+  Eval 001 (iter 00, low fidelity): EN = 73.4500
+  Eval 002 (iter 00, low fidelity): EN = 96.9820 [feasible]
+  Eval 003 (iter 00, low fidelity): EN = 45.6820
+  ...
+  Eval 019 (iter 00, low fidelity): EN = 45.0000 [feasible]
+  Eval 020 (iter 00, low fidelity): EN = 64.9890
+Iteration 1: fitting surrogates on 20 evaluations.
+  -> max acquisition score: 15.732
+  Eval 021 (iter 01, low fidelity): EN = 22.8740
+  Eval 022 (iter 01, low fidelity): EN = 27.9760
+Iteration 2: fitting surrogates on 22 evaluations.
+  -> max acquisition score: 7.183
+  Eval 023 (iter 02, low fidelity): EN = 37.5820 [feasible]
+  Eval 024 (iter 02, low fidelity): EN = 37.8380 [feasible]
+  -> best observed feasible: 37.582 (change: -7.418)
+  ...
+Iteration 7: fitting surrogates on 32 evaluations.
+  -> max acquisition score: 6.421
+  Eval 033 (iter 07, low fidelity): EN = 27.7795 [feasible]
+  Eval 034 (iter 07, low fidelity): EN = 32.4280 [feasible]
+  -> best observed feasible: 27.779 (change: -9.803)
+  ...
+Iteration 16: fitting surrogates on 50 evaluations.
+  -> max acquisition score: 0.930
+  Eval 051 (iter 16, low fidelity): EN = 26.6400 [feasible]
+  Eval 052 (iter 16, low fidelity): EN = 24.9230
+  -> best observed feasible: 26.640 (change: -0.297)
+  -> No improvement > 0.1% in last 5 iterations (count: 1)
+  ...
+Iteration 20: fitting surrogates on 58 evaluations.
+  -> max acquisition score: 0.199
+  Eval 059 (iter 20, low fidelity): EN = 25.1840
+  Eval 060 (iter 20, low fidelity): EN = 23.4960
+  -> best observed feasible: 26.640 (change: 0.000)
+```
+
+Reading it line by line:
+
+- **`Initialising ... seed = 2025`** confirms the run seed. Per-evaluation
+  seeds are derived from it, so the whole run is reproducible.
+- **`Eval 001 (iter 00, low fidelity): EN = 73.4500`**: iteration 00 is
+  the initial Latin hypercube design, 20 space-filling points evaluated
+  before any modeling happens. Each line reports the objective value; the
+  `[feasible]` tag appears when the evaluation satisfied every constraint.
+  Only 4 of the 20 initial points are feasible here, and the feasible ones
+  have large `EN` (the easy way to get power is a big trial). That is the
+  typical starting picture: feasibility is easy to buy with sample size,
+  and the optimization's job is to find the cheapest design that still
+  qualifies.
+- **`Iteration 1: fitting surrogates on 20 evaluations`**: the BO loop
+  proper begins. Each iteration refits the GP surrogates on everything
+  seen so far, scores a candidate pool with the acquisition function, and
+  evaluates the `q = 2` best candidates.
+- **`-> max acquisition score: 15.732`**: the acquisition value of the
+  most promising candidate. Watch this number across iterations: it
+  starts large (much apparent room for improvement) and decays toward
+  zero, with some wobble, as the surrogates firm up and the incumbent
+  gets hard to beat. A sustained collapse to nearly zero is one of
+  BATON's stopping signals (`status = "acq_flatline"`).
+- **`-> best observed feasible: 37.582 (change: -7.418)`**: the incumbent,
+  the best feasible objective so far, improved from 45.0 (found in the
+  initial design) to 37.58. The big drops at iterations 2 and 7 and the
+  small one at 16 are the classic BO trajectory: large early gains, then
+  refinement, then a plateau. From iteration 16 onward the incumbent does
+  not move; the run spends its remaining budget confirming there is
+  nothing better nearby, and ends when the 60-evaluation budget is
+  consumed.
+- **`-> No improvement > 0.1% in last 5 iterations (count: 1)`**: the
+  early-stopping counter. Two consecutive stagnant patience windows end
+  the run with `status = "early_stopped"`; here the counter was reset
+  once (the iteration-16 improvement was still inside the lookback
+  window) and the budget ran out before a second stagnant window
+  accumulated.
+- **`low fidelity` on every line**: the adaptive fidelity method judged
+  the cheap tier's information sufficient throughout this small, fast
+  problem. On harder problems, or with `fidelity_costs` reflecting a truly
+  expensive high tier, you will see `med` and `high` evaluations appear as
+  the run turns from exploration to verification. Either way, the pattern
+  is why the final high-fidelity verification step later in this vignette
+  is part of the workflow rather than an optional extra.
+
+## The Result Object
+
+```{r}
+fit$best_theta
 fit$best_objective
-
-# Why the run ended: "budget_exhausted", "early_stopped", "acq_flatline", ...
 fit$status
+```
 
-# Operating characteristics at the best design: the history tibble has one
-# unpacked column per metric, so subset the best feasible row directly
+`best_theta` is the best feasible design found: a trial with a maximum of
+about 28 patients, an interim look at about 42% of enrollment, a futility
+bar of about 0.23, and an efficacy bar of about 0.29. `best_objective` is
+its expected sample size under the alternative. Note the fractional
+`n_max`: BATON optimized a continuous parameter and the evaluator rounded
+internally, so before acting on this design you round it and re-check, as
+shown in the verification section. `status` records why the run ended;
+`"budget_exhausted"` means the full 60 evaluations were spent, the normal
+ending for a budget-sized run.
+
+Feasibility here is operational and deterministic: a design is marked
+`feasible` when its *observed* metrics satisfy every constraint, in this
+case observed power >= 0.80 and observed type I error <= 0.10 in that
+evaluation's own replicates. It is a statement about Monte Carlo
+estimates, not about the truth; a design whose true power is 0.79 can be
+marked feasible by a lucky batch of replicates, and vice versa. This is
+why constraint slack should exceed the Monte Carlo error and why
+verification at high fidelity matters for designs near a boundary.
+
+There is no `best_metrics` field; the metrics of the best design are read
+from the history, which stores one unpacked column per metric:
+
+```{r}
 feasible <- fit$history[fit$history$feasible, ]
 best_row <- feasible[which.min(feasible$objective), ]
 best_row[, c("power", "type1", "EN")]
-
-# Optimization history
-head(fit$history[, c("iter", "fidelity", "objective", "feasible")])
 ```
 
-# Memory-Efficient Variance Estimation
+The best design's observed power (0.818) is within about two standard
+errors of the 0.80 boundary at the low tier (`sqrt(0.8 * 0.2 / 2000)` is
+about 0.009), exactly the near-boundary situation the constraints section
+warned about. The verification section below settles it.
 
-**Why variance matters**: Providing variance estimates enables heteroskedastic Gaussian process surrogates, which dramatically improve optimization efficiency (30-50% fewer evaluations).
+## The History
 
-## Using `welford_mean_var()` for Efficiency
-
-Instead of storing all samples in memory, use Welford's online algorithm:
+Every evaluation the run performed is one row of `fit$history`:
 
 ```{r}
-# RECOMMENDED: Memory-efficient simulator using Welford's algorithm
-efficient_simulator <- function(theta, fidelity = "high", seed = NULL,
-                                n_rep = NULL, ...) {
-  # Fallback for calls outside BATON; keep in sync with your fidelity_levels
-  if (is.null(n_rep)) {
-    n_rep <- switch(fidelity,
-                    low = 2000,
-                    med = 4000,
-                    high = 10000)
-  }
-
-  if (!is.null(seed)) set.seed(seed)
-
-  # Use Welford's algorithm - no need to store all samples!
-  result <- welford_mean_var(
-    sample_fn = function(i, theta) {
-      # Simulate ONE trial
-      test_stat <- rnorm(1, mean = theta$threshold, sd = 1)
-      power <- as.numeric(abs(test_stat) > qnorm(1 - theta$alpha/2))
-
-      test_stat_null <- rnorm(1, mean = 0, sd = 1)
-      type1 <- as.numeric(abs(test_stat_null) > qnorm(1 - theta$alpha/2))
-
-      sample_size <- rpois(1, lambda = 100)
-
-      c(power = power,
-        type1 = type1,
-        EN = sample_size,
-        ET = sample_size / 10)
-    },
-    n_samples = n_rep,
-    theta = theta
-  )
-
-  # Extract results
-  metrics <- result$mean
-  attr(metrics, "variance") <- result$variance
-  attr(metrics, "n_rep") <- result$n
-
-  return(metrics)
-}
+names(fit$history)
 ```
 
-### Memory Comparison
+The columns fall into four groups: bookkeeping (`iter`, `eval_id`,
+`theta_id`, `fidelity`, `n_rep`), the design itself (`theta` and `unit_x`
+as list-columns, plus one unpacked column per parameter), the results
+(`metrics` and `variance` as list-columns, one unpacked column per metric,
+and `objective`), and the optimizer's view of the point (`feasible`,
+`prob_feas` the surrogate's feasibility probability when the point was
+proposed, `cv_estimate` its coefficient of variation, `acq_score` its
+acquisition value). The unpacked columns make ordinary data manipulation
+easy:
 
 ```{r}
-# Traditional approach (storing all samples)
-traditional_memory <- function(n_rep, n_metrics) {
-  8 * n_rep * n_metrics  # bytes
-}
-
-# Welford approach (incremental)
-welford_memory <- function(n_metrics) {
-  8 * 2 * n_metrics  # bytes (just mean and M2 vectors)
-}
-
-# For n_rep = 10,000 and 4 metrics:
-cat("Traditional: ", traditional_memory(10000, 4) / 1024, "KB\n")
-cat("Welford:     ", welford_memory(4), "bytes\n")
-cat("Reduction:   ", traditional_memory(10000, 4) / welford_memory(4), "x\n")
+head(fit$history[, c("iter", "fidelity", "n_rep", "objective", "feasible")])
+table(fit$history$fidelity)
+sum(fit$history$n_rep)  # total simulated trial replicates (per hypothesis)
 ```
 
-**Result**: Welford uses **5,000x less memory**. The accumulator adds a small
-per-sample cost that is negligible whenever simulating one trial does any real
-work; see the variance-estimation vignette for a benchmark and an honest
-reading of it.
+Two diagnostics worth glancing at after any run: the fraction of feasible
+evaluations (here `r sum(fit$history$feasible)` of
+`r nrow(fit$history)`; very low fractions suggest constraints near the
+edge of what the design space supports) and where the feasible points sit
+in objective terms.
 
-## Parallel Simulators with `pool_welford_results()`
+## Two Pictures of the Run
 
-For expensive simulations, run chunks in parallel and pool the results:
+With `ggplot2` installed, two built-in plots summarize the geometry of the
+run. The feasible frontier plot shows every evaluation in the
+(EN, power) plane, colored by feasibility. You can see the trade-off
+directly: power rises with expected sample size, the feasible points are
+those above the power floor, and the optimization has pushed into the
+bottom-left corner of the feasible set, small trials that still clear 80%
+power.
+
+```{r feasible-frontier, fig.alt="Scatter plot of power against expected sample size, colored by feasibility"}
+plot_feasible_frontier(fit)
+```
+
+The trade-off surface plot shows the same evaluations in the
+(type I error, power) plane, colored by objective value. The darker
+(low-EN) points cluster where both error rates are acceptable but not
+wastefully small, illustrating why minimizing EN pushes designs toward,
+but not across, the constraint boundaries.
+
+```{r tradeoff, fig.alt="Scatter plot of power against type I error, colored by objective value"}
+plot_tradeoff_surfaces(fit)
+```
+
+# Choosing Your Settings
+
+This table is the sizing reference for every knob, with `d` the number of
+design parameters. The paragraphs after it explain the failure modes each
+recommendation avoids.
+
+| Setting | Default | How to choose |
+|---------|---------|---------------|
+| `n_init` | 90 | Space-filling evaluations before BO starts. 10 x `d` for a working run; 4-5 x `d` for a quick pass. |
+| `budget` | 300 | Total evaluations including `n_init`. 20-30 x `d` for well-behaved problems; add 50-100% when constraints are tight. |
+| `q` | 2 | Evaluations proposed per BO iteration. 2-4; larger batches give wall-clock parallelism at a small cost in statistical efficiency. |
+| `bounds` | required | Bracket the plausible optimum generously; widen and re-run if the best design lands on a bound. Reparameterize interdependent parameters. |
+| `constraints` | required | Leave slack larger than the Monte Carlo error; verify near-boundary designs at higher fidelity. |
+| `fidelity_levels` | `c(low = 2000, med = 4000, high = 10000)` | Size the low tier cheap enough for exploration and the high tier precise enough for verification. |
+| `integer_params` | `NULL` | Names of parameters BATON rounds before calling your simulator. |
+| `seed` | 2025 | Run seed; per-evaluation seeds derive from it. |
+
+**`n_init`** buys the surrogates their first, unbiased look at the design
+space. Too small and two things go wrong: the GP fit is poorly conditioned
+(you may see surrogate fitting warnings, or lengthscales pinned at their
+bounds), and the first BO iterations chase noise in a model that has no
+real information yet, spending budget on points an adequate initial design
+would have ruled out. Too large and you waste budget that adaptive
+selection would have spent better; 10 x `d` is the standard compromise,
+and the default of 90 corresponds to a d = 9 problem at that rate. On an
+expensive simulator, remember that omitting `n_init` means 90 initial
+evaluations before the first BO iteration happens at all.
+
+**`budget`** is the total evaluation count, including the initial design,
+so `budget = 60` with `n_init = 20` leaves 40 BO evaluations, 20
+iterations at `q = 2`. The 20-30 x `d` guidance assumes the feasible
+region is a reasonable fraction of the box. When constraints carve out
+only a sliver, the optimizer first has to find the region before it can
+optimize within it, which is what the 50-100% surcharge pays for. The
+history tells you which situation you are in: if the first feasible point
+appears late and feasible rows stay rare, the budget is mostly funding the
+search for feasibility.
+
+**`q`** trades statistical efficiency for wall-clock time. With `q > 1`,
+BATON selects a spatially diverse batch (local penalization) rather than
+`q` near-duplicates of the top candidate, and with `options(BATON.cores)`
+set on Unix/macOS the batch is evaluated in parallel. Each point after the
+first in a batch is chosen with slightly staler information, which is the
+small efficiency cost.
+
+**`fidelity_levels`** should be sized from the constraint arithmetic. The
+low tier absorbs most evaluations, so it must be cheap; but it also
+decides which designs look feasible during the search, so its standard
+error should not dwarf your constraint slack. The high tier is the
+verification instrument: size it so the standard error is comfortably
+below the slack you care about. Four selection methods are available via
+`fidelity_method`:
+
+| Method | One-line description |
+|--------|----------------------|
+| `"adaptive"` (default) | Cost-aware: maximizes expected information gain per unit cost |
+| `"staged"` | Iteration-based schedule: low early, CV/boundary-triggered promotion mid-run, high late |
+| `"threshold"` | Legacy: P(feasible) >= 0.75 high, >= 0.40 med, else low |
+| `"hybrid_staged"` | MCEM-inspired staging with CV-based escalation and dynamic high-tier scaling |
+
+The default adaptive method computes, for each proposed design, a value
+score (acquisition value, objective uncertainty, and proximity to the
+feasibility boundary) and divides by the tier's cost raised to an exponent
+that grows as the run progresses and the budget depletes; the tier with
+the best value per unit cost wins. When computational cost does not scale
+linearly with replications (I/O overhead, parallel startup), pass
+`fidelity_costs` to tell the selector the true relative prices. Custom
+tiers are just a named vector; because `simple_simulator` declares an
+`n_rep` argument, BATON passes these exact counts to it and the internal
+`switch()` fallback is bypassed:
+
+```{r custom-fidelity, message=FALSE, warning=FALSE}
+fit_custom <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  fidelity_levels = c(low = 500, med = 2000, high = 5000),
+  n_init = 12,
+  budget = 30,
+  seed = 11
+)
+table(fit_custom$history$fidelity)
+```
+
+As in the main run, the adaptive selector kept this cheap problem entirely
+at the low tier; the chunk demonstrates the mechanics, and on an expensive
+simulator the same call produces a mixed tier allocation.
+
+**`integer_params`** moves the rounding from your evaluator into BATON.
+The practical difference shows up in the answer:
+
+```{r integer-params, message=FALSE}
+fit_int <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  n_init = 20, q = 2, budget = 60, seed = 2025,
+  integer_params = "n_max"
+)
+fit_int$best_theta$n_max
+fit_int$status
+```
+
+`best_theta$n_max` is now an integer, directly usable as a protocol
+number. This run also happens to demonstrate early stopping: the
+incumbent stopped improving and the run ended as `"early_stopped"` (no
+relative improvement above 0.1% over a 5-iteration patience window, twice
+in a row; configure or disable via the `early_stop` argument) rather than
+spending its full budget. Rounding coarsens the search space, so distinct
+proposals can map to the same evaluated design, which tends to bring
+convergence forward.
+
+**`seed`** makes runs reproducible end to end. BATON derives a
+deterministic per-evaluation seed from the run seed and passes it to your
+evaluator, and restores your session's RNG stream on exit, so a
+calibration does not perturb other random work in your script.
+
+## Run Profiles: Quick, Balanced, Thorough
+
+Rather than reasoning about each knob from scratch every time, start from
+one of three profiles:
+
+| Setting | Quick | Balanced | Thorough |
+|---------|-------|----------|----------|
+| `n_init` | 4-5 x d | 10 x d | 10 x d |
+| `budget` | 10-15 x d | 20-30 x d | 40-50 x d or more |
+| `fidelity_levels` | `c(low = 200, med = 500, high = 2000)` | default | raise high tier (e.g., `high = 50000`) |
+| `q` | 2-4 | 2 | 2 |
+| `early_stop` | default | default | `list(enabled = FALSE)` or tightened `threshold` |
+| `multi_seed_verify` | `FALSE` | `TRUE` | `TRUE` with `multi_seed_n = 10` |
+
+Use Quick while you iterate on the problem formulation: debugging the
+evaluator, taking a first look at a new design space, checking that
+feasibility is achievable at all, adjusting bounds and constraints. Runs
+take minutes, and the low tier's precision is coarse; at 200 replicates a
+proportion near 0.8 has standard error `sqrt(0.8 * 0.2 / 200)`, about
+0.028, so operating characteristics are good to roughly +/- 2-3 percentage
+points. Switch to Balanced for the run whose answer you intend to act on:
+overnight or lunch-scale depending on your simulator, with high-tier
+standard errors around 0.003-0.005 at the default 10,000 replicates.
+Reserve Thorough for manuscript or regulatory numbers, for constraints
+sitting within about 2 standard errors of a boundary, and for d >= 6; at
+`high = 50000` the standard error drops to about 0.002:
+
+```{r}
+round(c(quick_low   = sqrt(0.8 * 0.2 / 200),
+        balanced_high = sqrt(0.8 * 0.2 / 10000),
+        thorough_high = sqrt(0.8 * 0.2 / 50000)), 4)
+```
+
+Move between profiles as the problem firms up; the worked example above is
+a Quick-profile run, which is why its answer gets a verification pass
+before anyone acts on it.
+
+# When Things Go Wrong
+
+## Nothing Is Feasible
+
+The clearest failure mode is a constraint set the design space cannot
+satisfy. Here is what it looks like: the same problem as above, but
+demanding 99% power with 1% type I error.
+
+```{r infeasible-demo, warning=TRUE, message=FALSE}
+fit_bad <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = list(power = c("ge", 0.99), type1 = c("le", 0.01)),
+  n_init = 12, q = 2, budget = 24, seed = 7,
+  progress = FALSE
+)
+any(fit_bad$history$feasible)
+max(fit_bad$history$power)
+min(fit_bad$history$type1)
+```
+
+Three things to notice. First, the warning (emitted at each internal
+best-point lookup, so it can print more than once): when no evaluation
+satisfies all constraints, BATON warns and returns the best *infeasible*
+point in `best_theta`, so the fit object is still usable as a starting
+point rather than an error. Second, the diagnosis is in the history:
+designs in this space get close to 99% power (0.989 observed), and
+separately reach essentially zero type I error, but no evaluated design
+achieved both at once, so the joint requirement is what fails. Third, `prob_feas` in the history stays low across the run,
+the surrogate's own way of saying the feasible region looks empty.
+
+What to do: check the constraint thresholds are achievable at all (a
+larger `n_max` upper bound would help here), expand the bounds in the
+direction the near-feasible points are piling up, or relax the thresholds.
+If you believe the region exists but is small, increase the budget; the
+expected-violation logic steers the search toward the feasibility boundary
+even before the first feasible point is found. When in doubt, run the
+infeasible fit's best point through your simulator at high `n_rep` and
+look at how far each constraint actually is from its threshold.
+
+## The Best Design Sits on a Bound
+
+If any component of `best_theta` is at (or hard against) the edge of its
+box, the optimum probably lies outside the box, and the reported best is
+just where the search ran out of room. Widen that bound and re-run,
+optionally passing the previous run's evaluations via
+`initial_history = fit$history` so the earlier budget is not wasted. The
+`refine_bounds()` helper automates the opposite move, shrinking bounds
+around the best region for a second-stage run; see
+`vignette("advanced-features")`.
+
+## Reading fit$status
+
+`fit$status` always records why the run ended:
+
+| `status` | Meaning |
+|----------|---------|
+| `budget_exhausted` | Normal completion: the evaluation budget was consumed |
+| `early_stopped` | Converged: no meaningful improvement over the patience window |
+| `acq_flatline` | Acquisition values collapsed; no candidate looks promising |
+| `walltime` | The `max_walltime_s` cap tripped; result is whatever was found in time |
+| `cancelled` | Your `callback` requested cancellation |
+| `errored` | A failure was caught under `on_error = "return_partial"`; see `fit$error_message` |
+
+`budget_exhausted` and `early_stopped` are the two healthy endings.
+`acq_flatline` after very few iterations suggests the surrogates see no
+structure, worth checking that your metrics actually vary across the
+bounds. `walltime`, `cancelled`, and `errored` all return partial but
+internally consistent fits: the history contains every completed
+evaluation, and `best_theta` is the best of what was seen.
+
+## Surrogate Fitting Failures
+
+An error like `Failed to fit surrogate for metric ...` means the GP's
+covariance matrix was ill-conditioned, usually because the design points
+are too few or too clustered, or because a variance estimate was zero or
+non-finite. Increase `n_init` for a more diverse initial design, and check
+your evaluator's variance attribute is positive and finite for every
+metric (a metric that is constant across replicates, for example type I
+error estimated as exactly 0 from a small `n_rep`, produces a zero
+variance; more replicates or the binomial fallback both avoid this).
+
+## Performance Seems Slow
+
+First check whether the time is going into your simulator or into BATON's
+modeling; on all but toy problems the simulator dominates, and the fix is
+parallelism inside the evaluator (see Scaling Up below). If the modeling
+side is slow, note the candidate pool is sized adaptively at 500 x `d`
+points, clamped to [1000, 5000], with a 50% increase in the final 30% of
+iterations; the `candidate_pool` argument only sets a floor (default
+2000), so lowering it below the adaptive size has no effect.
+
+# Before You Trust the Answer
+
+Three checks before a calibrated design goes anywhere important.
+
+## 1. Verify at High Fidelity Across Seeds
+
+Most evaluations during a run happen at low fidelity, and the incumbent
+was selected partly because its noise broke in its favor. Setting
+`multi_seed_verify = TRUE` adds a verification stage after the
+optimization: the best design is re-evaluated at `multi_seed_n`
+independent seeds (default 5) at high fidelity
+(`multi_seed_reps`, default `fidelity_levels[["high"]]`), and the fit
+gains a verdict. The call below is the worked example's calibration with
+only that flag added; the optimization itself is identical because the
+seed is the same.
+
+```{r verify, message=FALSE}
+fit_verified <- bo_calibrate(
+  sim_fun = simple_simulator,
+  bounds = bounds,
+  objective = objective,
+  constraints = constraints,
+  n_init = 20, q = 2, budget = 60, seed = 2025,
+  multi_seed_verify = TRUE
+)
+fit_verified$verdict
+# multi_seed_summary is a named list; pull out the cross-seed means and sds
+round(unlist(fit_verified$multi_seed_summary[
+  c("n_seeds", "n_rep", "power_mean", "power_sd",
+    "type1_mean", "type1_sd", "EN_mean", "EN_sd")]), 4)
+```
+
+`MULTI_SEED_PASS` means the design was feasible at every verification
+seed: at 10,000 replicates per seed, power holds at about 0.814 (above
+0.80) and type I error at about 0.080 (below 0.10), with cross-seed
+standard deviations small enough to rule out a fluke. The other verdicts
+are `MULTI_SEED_FAIL` (at least one seed violated a constraint, under the
+default `multi_seed_strict = TRUE`) and `MULTI_SEED_WARN` (the same
+failure with `multi_seed_strict = FALSE`). A failed verdict on a
+near-boundary design is common and informative: it usually means the
+optimizer exploited low-fidelity noise, and the remedy is a slightly
+slacker constraint, a larger budget, or a Thorough-profile re-run.
+
+## 2. Round Integer Parameters and Re-Check
+
+Unless you passed `integer_params`, `best_theta` comes back fractional.
+Round to the design you would actually run, then re-simulate at large
+`n_rep` to confirm the rounded design still meets the constraints:
+
+```{r round-recheck}
+theta_final <- fit$best_theta
+theta_final$n_max <- round(theta_final$n_max)
+
+final_check <- simple_simulator(theta_final, seed = 999, n_rep = 100000)
+round(final_check, 4)
+```
+
+At 100,000 replicates the standard errors are around 0.001, so this is as
+close to ground truth as simulation gets: the rounded design keeps power
+above 0.80 and type I error below 0.10. If rounding had pushed a
+constraint over its threshold (it can, when the optimum sits near a
+boundary), the fix is to check the neighboring integer designs by hand or
+re-run with `integer_params` so the optimizer only ever visits integer
+designs.
+
+## 3. Check fit$status
+
+Confirm the run ended for a healthy reason (`"budget_exhausted"` or
+`"early_stopped"`). A `"walltime"` or `"cancelled"` result is whatever was
+found in the time available, not a converged answer, and an `"errored"`
+fit should be inspected via `fit$error_message` before any of its numbers
+are reused.
+
+# Scaling Up
+
+## Parallelism Inside the Evaluator
+
+The main opportunity for parallelism is inside your evaluator: splitting
+Monte Carlo replicates across cores so each evaluation completes faster.
+`pool_welford_results()` combines chunk-level Welford accumulators with
+Chan's algorithm, preserving exact means and variances:
 
 ```{r eval=FALSE}
 parallel_simulator <- function(theta, fidelity = "high", n_cores = 4,
@@ -303,15 +986,12 @@ parallel_simulator <- function(theta, fidelity = "high", n_cores = 4,
   }
   chunk_size <- ceiling(n_rep / n_cores)
 
-  # Run chunks in parallel
-  library(parallel)
-  # NOTE: mclapply() is POSIX-only (no forking on Windows). Windows users should
-  # use a PSOCK cluster (parallel::makeCluster() + parLapply()) or plain lapply().
-  chunks <- mclapply(1:n_cores, function(core_id) {
+  # NOTE: mclapply() is POSIX-only (no forking on Windows). Windows users
+  # should use a PSOCK cluster (parallel::makeCluster() + parLapply()).
+  chunks <- parallel::mclapply(1:n_cores, function(core_id) {
     welford_mean_var(
       sample_fn = function(i, theta) {
-        # REPLACE with one replicate of YOUR trial; return a named vector,
-        # e.g. c(power = ..., EN = ...)
+        # REPLACE with one replicate of YOUR trial; return a named vector
         stop("REPLACE: simulate one replicate of your design")
       },
       n_samples = chunk_size,
@@ -319,302 +999,86 @@ parallel_simulator <- function(theta, fidelity = "high", n_cores = 4,
     )
   }, mc.cores = n_cores)
 
-  # Pool results using Chan's algorithm
   pooled <- pool_welford_results(chunks)
 
   metrics <- pooled$mean
   attr(metrics, "variance") <- pooled$variance
   attr(metrics, "n_rep") <- pooled$n
-
-  return(metrics)
+  metrics
 }
 ```
 
-# Multi-Fidelity Optimization
+Each chunk gets `ceiling(n_rep / n_cores)` replicates, so the total may
+slightly exceed `n_rep`; that is harmless, and reporting `pooled$n` keeps
+the accounting honest. Separately, `options(BATON.cores = k)` evaluates
+the points *within* a batch in parallel on Unix/macOS, which pays off when
+`q > 1`; the two levels of parallelism multiply, so budget your cores
+across them. `vignette("variance-estimation")` covers the Welford
+machinery, its numerical properties, and an honest benchmark of its
+overhead.
 
-BATON automatically manages multi-fidelity evaluations to maximize efficiency:
+## Service and Long-Run Controls
 
-## How It Works
-
-By default BATON uses the `"adaptive"` fidelity method: for each proposed
-design it computes a value score (acquisition value, objective uncertainty,
-and proximity to the feasibility boundary) and divides by the tier's cost
-raised to an exponent that grows as the run progresses and the budget
-depletes. The tier with the best value per unit cost wins, so early
-iterations spend cheap replications on exploration and late iterations
-reserve expensive replications for verification.
-
-The default replication counts are
-`fidelity_levels = c(low = 2000, med = 4000, high = 10000)`; the README's
-"Choosing Your Settings" table explains how to size them.
-
-Four methods are available via `fidelity_method`:
-
-| Method | One-line description |
-|--------|----------------------|
-| `"adaptive"` (default) | Cost-aware: maximizes expected information gain per unit cost |
-| `"staged"` | Iteration-based schedule: low early, CV/boundary-triggered promotion mid-run, high late |
-| `"threshold"` | Legacy: P(feasible) >= 0.75 high, >= 0.40 med, else low |
-| `"hybrid_staged"` | MCEM-inspired staging with CV-based escalation and dynamic high-tier scaling |
+For unattended, scheduled, or cluster runs, `bo_calibrate()` has controls
+for capping walltime, checkpointing, surviving simulator failures, and
+cooperative cancellation; details for each are in `?bo_calibrate`.
 
 ```{r eval=FALSE}
-# Examine fidelity allocation (depends on `fit` from the non-evaluated
-# bo_calibrate chunk above)
-table(fit$history$fidelity)
+fit <- bo_calibrate(
+  sim_fun = simple_simulator, bounds = bounds, objective = "EN",
+  constraints = constraints, n_init = 20, budget = 60, seed = 42,
+  max_walltime_s = 6 * 3600,    # graceful stop before the scheduler kills the job
+  checkpoint_fun = function(snap) saveRDS(snap, "checkpoint.rds"),
+  checkpoint_every = 5,         # snapshot every 5 BO iterations
+  on_error = "return_partial",  # keep completed evaluations if the simulator fails
+  callback = function(info) !file.exists("STOP"),  # return TRUE to continue
+  slim = TRUE                   # lightweight return: skips the final surrogate refit
+)
 
-# Total simulation budget used
-sum(fit$history$n_rep)
-```
-
-## Custom Fidelity Levels
-
-```{r eval=FALSE}
-fit_custom <- bo_calibrate(
-  sim_fun = simple_simulator,
-  bounds = bounds,
-  objective = objective,
-  constraints = constraints,
-  # Custom fidelity levels. Because simple_simulator declares an n_rep
-  # argument, BATON passes these exact counts to it (the simulator's internal
-  # switch() fallback is bypassed).
-  fidelity_levels = c(
-    low = 100,
-    med = 500,
-    high = 5000
-  ),
-  n_init = 10,
-  budget = 50
+# Resume a stopped run from its checkpoint
+ck <- readRDS("checkpoint.rds")
+fit <- bo_calibrate(
+  sim_fun = simple_simulator, bounds = bounds, objective = "EN",
+  constraints = constraints, initial_history = ck$history,
+  n_init = nrow(ck$history), budget = nrow(ck$history) + 20, seed = 43
 )
 ```
 
-# Benchmarking and Comparison
+Every one of these endings produces a valid `BATON_fit` whose `status`
+field says what happened, so downstream code can branch on it.
 
-Compare Bayesian optimization against baseline strategies:
+# Where to Go Next
 
-```{r eval=FALSE}
-benchmark <- benchmark_methods(
-  sim_fun = simple_simulator,
-  bounds = bounds,
-  objective = objective,
-  constraints = constraints,
-  strategies = c("bo", "random", "grid"),
-  bo_args = list(n_init = 10, q = 2, budget = 30, seeds = 1:3),
-  random_args = list(n_samples = 30, seeds = 1:3),
-  # resolution names must match the names in `bounds`; misspelled names fall
-  # back to the first listed resolution silently
-  grid_args = list(resolution = list(n_max = 3, interim_fraction = 3,
-                                     futility_threshold = 3,
-                                     efficacy_threshold = 3))
-)
+This vignette covered the core workflow: one evaluator, one calibration,
+verified. The package's other vignettes each go deeper on one axis:
 
-# Summary statistics
-summary_tbl <- summarise_benchmark(benchmark)
-print(summary_tbl)
+- **`vignette("BATON-methods")`**: how the optimizer works internally, GP
+  surrogates and their noise models, the expected constrained improvement
+  acquisition, batch selection by local penalization, and the
+  multi-fidelity selection methods. Read this to understand *why* the
+  settings above are sized the way they are.
+- **`vignette("BATON-case-study")`**: an end-to-end realistic calibration,
+  including sensitivity analysis (Sobol indices, gradients), benchmarking
+  BO against grid and random search, and calibrating a family of designs
+  under different design philosophies.
+- **`vignette("advanced-features")`**: multi-stage workflows,
+  `refine_bounds()`, warm-starting from saved state, and fidelity control.
+- **`vignette("variance-estimation")`**: Welford's algorithm, pooling with
+  `pool_welford_results()`, and when the variance attributes matter most.
+- **`vignette("v04-hardening")`**: cross-philosophy warm-starts and the
+  multi-seed verification gate in depth.
 
-# Visualization
-plot_benchmark_trajectory(benchmark)
-plot_benchmark_efficiency(benchmark)
-```
-
-# Sensitivity Analysis
-
-Understand which parameters most influence your objective:
-
-```{r eval=FALSE}
-# Sobol sensitivity indices
-sobol <- sa_sobol(
-  surrogates = fit$surrogates,
-  bounds = bounds,
-  outcome = "EN",
-  n_mc = 2000
-)
-
-print(sobol)
-plot_sobol_indices(sobol)
-
-# Local gradients
-gradients <- sa_gradients(
-  surrogates = fit$surrogates,
-  theta = fit$best_theta,
-  bounds = bounds,
-  outcome = "EN"
-)
-
-print(gradients)
-
-# Gradient covariance across design space
-cov_matrix <- cov_effects(
-  surrogates = fit$surrogates,
-  bounds = bounds,
-  outcome = "EN",
-  n_mc = 500
-)
-
-print(cov_matrix)
-```
-
-# Advanced Topics
-
-## Constraint Reliability
-
-Validate that calibrated designs truly satisfy constraints:
-
-```{r eval=FALSE}
-reliability <- estimate_constraint_reliability(
-  sim_fun = simple_simulator,
-  bounds = bounds,
-  objective = objective,
-  constraints = constraints,
-  strategies = c("bo", "random"),
-  calibration_seeds = 1:10,
-  validation_reps = 50000,  # Large sample validation
-  bo_args = list(n_init = 10, budget = 30)
-)
-
-print(reliability$summary)
-plot_constraint_reliability(reliability)
-```
-
-## Multi-fidelity Ablation
-
-Study the impact of different fidelity policies:
-
-```{r eval=FALSE}
-ablation <- ablation_multifidelity(
-  sim_fun = simple_simulator,
-  bounds = bounds,
-  objective = objective,
-  constraints = constraints,
-  policies = list(
-    low_only = c(low = 200),
-    med_only = c(med = 1000),
-    full = c(low = 200, med = 1000, high = 10000)
-  ),
-  seeds = 1:10,
-  bo_args = list(n_init = 10, budget = 30)
-)
-
-print(ablation$summary)
-plot_multifidelity_tradeoff(ablation)
-```
-
-## Case Study Reporting
-
-Extract publication-ready summaries:
-
-```{r eval=FALSE}
-# Summarize calibrated design
-summary <- summarise_case_study(fit)
-print(summary$design)
-print(summary$operating_characteristics)
-
-# Comprehensive diagnostics
-diagnostics <- case_study_diagnostics(
-  fit,
-  sobol_samples = 5000,
-  gradient_points = 200
-)
-
-# Visualizations
-plot_feasible_frontier(fit)
-plot_tradeoff_surfaces(fit)
-plot_case_sobol(diagnostics$sobol)
-plot_case_gradient(diagnostics$gradients)
-plot_case_covariance(diagnostics$covariance)
-```
-
-# Best Practices
-
-## Do:
-
-1. **Always provide variance estimates** in your simulator
-   - Use `welford_mean_var()` for memory efficiency
-   - Enables heteroskedastic GP for 30-50% better performance
-
-2. **Set appropriate fidelity levels**
-   - Defaults: low = 2,000, med = 4,000, high = 10,000 replications
-   - Size the low tier cheap enough for exploration (it absorbs most
-     evaluations) and the high tier precise enough for verification; see the
-     README's "Choosing Your Settings" table
-
-3. **Use sufficient initial design** (d = number of parameters)
-   - Quick profile (first exploratory run): `n_init = 4-5 x d`
-   - Balanced/Thorough (runs you act on): `n_init = 10 x d`
-   - See the README's "Run Profiles" table for the full sizing guidance
-
-4. **Monitor convergence**
-   - Check `fit$history` for stagnation
-   - Increase budget if needed
-
-5. **Validate results**
-   - Use `estimate_constraint_reliability()` with large samples
-   - Confirm operating characteristics match expectations
-
-## Avoid:
-
-1. **Don't skip variance estimation**
-   - Nugget fallback works but is 30-50% less efficient
-   - For expensive simulations, this wastes significant time
-
-2. **Don't use too small budgets**
-   - Quick profile: `budget = 10-15 x d` for a first exploratory pass
-   - Balanced: `20-30 x d`; Thorough: `40-50 x d` or more
-   - Add 50-100% when constraints are tight (narrow feasible region)
-
-3. **Don't ignore infeasibility warnings**
-   - If no feasible points found, relax constraints or expand bounds
-
-4. **Don't over-trust surrogates far from data**
-   - GP predictions are uncertain in unexplored regions
-   - Use sensitivity analysis to understand uncertainty
-
-# Troubleshooting
-
-## Error: "Failed to fit surrogate for metric..."
-
-**Cause**: GP fitting failed due to ill-conditioned covariance matrix
-
-**Solutions**:
-- Increase `n_init` for more diverse initial design
-- Check for redundant/highly correlated evaluations
-- Verify variance estimates are positive and finite
-
-## Warning: "No feasible solutions found"
-
-**Cause**: Constraints are too strict or bounds are wrong
-
-**Solutions**:
-- Check constraint thresholds are achievable
-- Expand parameter bounds
-- Increase budget to explore more
-
-## Performance seems slow
-
-**Check**:
-1. Are you providing variance? (Check `attr(metrics, "variance")`)
-2. Is your simulator the bottleneck? (Profile it)
-3. Is the candidate pool oversized? The pool is sized adaptively: 500 x d,
-   clamped to [1000, 5000], with a 50% increase in the final 30% of
-   iterations. The `candidate_pool` argument only sets a floor (default 2000).
-
-# Before You Act on a Result
-
-Before a calibrated design goes anywhere important, follow the README's
-"Before You Trust the Answer" checklist: verify the best design at high
-fidelity (`multi_seed_verify = TRUE`), round integer parameters and re-check
-the operating characteristics, and inspect `fit$status` to see why the run
-ended (`"budget_exhausted"`, `"early_stopped"`, `"acq_flatline"`, and the
-service-control statuses). The README's "Run Profiles" table gives the
-Quick/Balanced/Thorough settings referenced throughout this vignette.
-
-# Further Resources
-
-- **README**: "Choosing Your Settings", "Run Profiles", and "Before You
-  Trust the Answer" sections (single source of truth for sizing guidance)
-- **Other vignettes**: `vignette("advanced-features")`,
-  `vignette("variance-estimation")`, `vignette("v04-hardening")`
-- **Release notes**: `NEWS.md`
-- **Examples**: `system.file("examples/simulator_with_variance.R", package = "BATON")`
+For analyses beyond a single calibration, the package also ships
+`benchmark_methods()` (compare BO against grid/random/heuristic
+strategies), `estimate_constraint_reliability()` (large-sample validation
+of constraint satisfaction across repeated calibrations),
+`ablation_multifidelity()` (compare fidelity policies), and the
+`sa_sobol()` / `sa_gradients()` / `summarise_case_study()` family for
+sensitivity analysis and reporting; the case-study vignette demonstrates
+them in context. See also the project README on GitHub for release notes
+and installation troubleshooting, and
+`system.file("examples/simulator_with_variance.R", package = "BATON")` for
+additional evaluator patterns.
 
 # Session Info
 
